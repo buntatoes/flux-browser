@@ -99,6 +99,7 @@ pub struct AnvilVmTelemetry {
     pub ic_misses: u32,
     pub polymorphic_ic_sites: u32,
     pub hot_loops_accelerated: u32,
+    pub native_compilations: u32,
 }
 
 #[cfg(anvil_cpp_jit)]
@@ -118,6 +119,14 @@ unsafe extern "C" {
         telemetry_out: *mut AnvilVmTelemetry,
         numeric_result_out: *mut f64,
     ) -> u32;
+    fn anvil_cpp_vm_global_count(context: *mut u8) -> u32;
+    fn anvil_cpp_vm_copy_global(
+        context: *mut u8,
+        index: u32,
+        name_out: *mut u8,
+        name_cap: u32,
+        value_out: *mut f64,
+    ) -> u32;
     fn anvil_cpp_vm_run_ic_benchmark(
         context: *mut u8,
         iterations: u32,
@@ -126,11 +135,11 @@ unsafe extern "C" {
     fn anvil_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
 }
 
-/// `true` when the C++20 `AnvilVM` library is linked and its version symbol is 16.
+/// `true` when the C++20 `AnvilVM` library is linked and its version symbol is 17.
 pub fn is_cpp_jit_kernel_active() -> bool {
     #[cfg(anvil_cpp_jit)]
     {
-        unsafe { anvil_cpp_jit_kernel_version() == 16 }
+        unsafe { anvil_cpp_jit_kernel_version() == 17 }
     }
     #[cfg(not(anvil_cpp_jit))]
     {
@@ -292,6 +301,64 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, AnvilVmTelemetry)> {
     }
 }
 
+/// Run `source` on the C++ VM and return numeric globals along with the halt value.
+/// `None` when the compiler rejects the script.
+pub fn eval_cpp_vm_script_bindings(
+    source: &str,
+) -> Option<(f64, Vec<(String, f64)>, AnvilVmTelemetry)> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    #[cfg(anvil_cpp_jit)]
+    unsafe {
+        let mut owner = VmOwner::empty();
+        if !owner.ensure() {
+            return None;
+        }
+        let mut result = 0.0_f64;
+        let mut telemetry = AnvilVmTelemetry::default();
+        let code = anvil_cpp_vm_run_script(
+            owner.context,
+            owner.compiler,
+            trimmed.as_ptr(),
+            trimmed.len() as u32,
+            &mut telemetry,
+            &mut result,
+        );
+        if code == 0 {
+            return None;
+        }
+        let mut bindings = Vec::new();
+        let count = anvil_cpp_vm_global_count(owner.context);
+        for index in 0..count {
+            let mut name = [0u8; 64];
+            let mut value = 0.0_f64;
+            let copied = anvil_cpp_vm_copy_global(
+                owner.context,
+                index,
+                name.as_mut_ptr(),
+                name.len() as u32,
+                &mut value,
+            );
+            if copied == 1 {
+                let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+                if let Ok(text) = std::str::from_utf8(&name[..end]) {
+                    if !text.is_empty() {
+                        bindings.push((text.to_string(), value));
+                    }
+                }
+            }
+        }
+        return Some((result, bindings, telemetry));
+    }
+    #[cfg(not(anvil_cpp_jit))]
+    {
+        let _ = trimmed;
+        None
+    }
+}
+
 /// Run the C++20 `AnvilShape` hidden-class transition, 4-way polymorphic Inline Cache,
 /// and Mark-Sweep GC benchmark for `iterations` cycles.
 pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
@@ -323,6 +390,7 @@ pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, AnvilVmTelemetry) {
                 ic_misses: 4,
                 polymorphic_ic_sites: 2,
                 hot_loops_accelerated: 1,
+                native_compilations: 0,
             },
         )
     }
@@ -1115,6 +1183,54 @@ impl ScriptRuntime {
         }
     }
 
+    fn try_native_numeric_loop(&mut self, statement: &str) -> bool {
+        if !self.jit_stats.jit_enabled || !is_cpp_jit_kernel_active() {
+            return false;
+        }
+        let Some(runnable) = native_loop_program(statement) else {
+            return false;
+        };
+        if !numeric_loop_text(&runnable) && !numeric_loop_text(statement) {
+            return false;
+        }
+        let mut prelude = String::new();
+        for name in ident_names(&runnable) {
+            if numeric_keyword(&name) {
+                continue;
+            }
+            match self.vars.iter().rev().find(|(key, _)| key == &name) {
+                Some((_, Value::Number(number))) => {
+                    prelude.push_str(&format!("{name} = {};", format_jit_number(*number)));
+                }
+                Some(_) => return false,
+                None if runnable.contains(&format!("{name} =")) => {}
+                None => return false,
+            }
+        }
+        let source = format!("{prelude}{runnable}");
+        let Some((_, bindings, telemetry)) = eval_cpp_vm_script_bindings(&source) else {
+            return false;
+        };
+        if telemetry.native_compilations == 0 {
+            return false;
+        }
+        for (name, value) in bindings {
+            self.set_var(&name, Value::Number(value));
+        }
+        self.jit_stats.vm_telemetry.native_compilations = self
+            .jit_stats
+            .vm_telemetry
+            .native_compilations
+            .saturating_add(telemetry.native_compilations);
+        self.jit_stats.vm_telemetry.bytecode_ops_executed = self
+            .jit_stats
+            .vm_telemetry
+            .bytecode_ops_executed
+            .saturating_add(telemetry.bytecode_ops_executed);
+        self.jit_stats.compiled_blocks = self.jit_stats.compiled_blocks.saturating_add(1);
+        true
+    }
+
     fn exec_statement(&mut self, doc: &mut Document, raw: &str) {
         if !self.consume_step() {
             return;
@@ -1193,6 +1309,9 @@ impl ScriptRuntime {
             if rest.starts_with('(') {
                 if let Some((cond_str, after_cond)) = extract_paren_group(rest) {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_cond) {
+                        if self.try_native_numeric_loop(stmt) {
+                            return;
+                        }
                         for _ in 0..10_000 {
                             if self.aborted || !self.eval_expr(doc, &cond_str).is_truthy() {
                                 break;
@@ -1212,6 +1331,9 @@ impl ScriptRuntime {
                     if let Some((loop_body, _)) = extract_first_brace_block(after_header) {
                         let parts: Vec<&str> = header_str.splitn(3, ';').collect();
                         if parts.len() == 3 {
+                            if self.try_native_numeric_loop(stmt) {
+                                return;
+                            }
                             self.exec_statement(doc, parts[0]);
                             for _ in 0..10_000 {
                                 if self.aborted {
@@ -2642,6 +2764,102 @@ enum VmRun {
 ///
 /// The numeric VM does not see the DOM, `fetch()`, or storage. A script that
 /// names any of those stays here even if the compiler would accept the rest.
+fn native_loop_program(statement: &str) -> Option<String> {
+    let trimmed = statement.trim();
+    if trimmed.starts_with("while") {
+        return Some(trimmed.to_string());
+    }
+    let rest = trimmed.strip_prefix("for")?.trim_start();
+    let (header, after) = extract_paren_group(rest)?;
+    let (body, _) = extract_first_brace_block(after)?;
+    let parts: Vec<&str> = header.splitn(3, ';').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let init = parts[0]
+        .trim()
+        .trim_start_matches("let ")
+        .trim_start_matches("var ")
+        .trim_start_matches("const ");
+    let cond = parts[1].trim();
+    let step = parts[2].trim();
+    if cond.is_empty() {
+        return None;
+    }
+    let mut program = String::new();
+    if !init.is_empty() {
+        program.push_str(init);
+        if !init.ends_with(';') {
+            program.push(';');
+        }
+    }
+    program.push_str("while (");
+    program.push_str(cond);
+    program.push_str(") {");
+    program.push_str(&body);
+    if !step.is_empty() {
+        if !body.trim().ends_with(';') && !body.trim().is_empty() {
+            program.push(';');
+        }
+        program.push_str(step);
+        if !step.ends_with(';') {
+            program.push(';');
+        }
+    }
+    program.push('}');
+    Some(program)
+}
+
+fn numeric_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "while" | "for" | "let" | "const" | "var" | "if" | "else" | "return" | "true" | "false"
+    )
+}
+
+fn format_jit_number(number: f64) -> String {
+    if number.fract() == 0.0 && number.abs() < 1.0e15 {
+        format!("{}", number as i64)
+    } else {
+        format!("{number}")
+    }
+}
+
+fn numeric_loop_text(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    if !trimmed.starts_with("while") && !trimmed.starts_with("for") {
+        return false;
+    }
+    if trimmed.contains(['.', '[', ']', '\'', '"', '`']) {
+        return false;
+    }
+    !trimmed.contains("function")
+}
+
+fn ident_names(statement: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = String::new();
+    for ch in statement.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            if current.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && !names.iter().any(|existing| existing == &current)
+            {
+                names.push(current);
+            }
+            current = String::new();
+        }
+    }
+    if !current.is_empty()
+        && current.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && !names.iter().any(|existing| existing == &current)
+    {
+        names.push(current);
+    }
+    names
+}
+
 fn script_stays_on_rust(source: &str) -> bool {
     const BLOCKED: &[&str] = &[
         "document",
@@ -3450,11 +3668,35 @@ mod tests {
             let (res, telemetry) = eval_cpp_vm_script(vm_source).expect("AnvilVM compiled & ran");
             // sum_{i=1..20} (i + i^2) = 210 + 2870 = 3080
             assert_eq!(res, 3080.0);
-            assert_eq!(telemetry.kernel_version, 16);
+            assert_eq!(telemetry.kernel_version, 17);
             assert!(telemetry.bytecode_ops_executed > 50);
             assert!(telemetry.shapes_allocated >= 3);
             assert!(telemetry.ic_hits >= 30);
             assert!(telemetry.hot_loops_accelerated >= 1);
+        }
+
+        if is_cpp_jit_kernel_active() {
+            let numeric = "let s = 0; let i = 1; while (i <= 100) { s = s + i * i; i = i + 1; } s;";
+            let (sum, native_telemetry) = eval_cpp_vm_script(numeric).expect("numeric loop compiled");
+            assert_eq!(sum, 338350.0);
+            assert!(native_telemetry.native_compilations >= 1);
+            assert!(native_telemetry.bytecode_ops_executed > 100);
+        }
+
+        if is_cpp_jit_kernel_active() {
+            let mut doc = parse_html(
+                "<p id=\"out\"></p><script>
+                   let s = 0;
+                   let i = 1;
+                   while (i <= 100) { s = s + i * i; i = i + 1; }
+                   document.getElementById('out').textContent = s;
+                 </script>",
+            );
+            let mut runtime = ScriptRuntime::with_jit_enabled(true);
+            runtime.run_document_scripts(&mut doc);
+            let out = doc.get_element_by_id("out").unwrap();
+            assert_eq!(doc.text_content(out), "338350");
+            assert!(runtime.jit_stats().vm_telemetry.native_compilations >= 1);
         }
 
         let (_, bench_telemetry) = run_cpp_vm_ic_benchmark(64);

@@ -32,7 +32,7 @@ pub mod ui;
 pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.18";
+pub const VERSION: &str = "v.19";
 
 use std::collections::HashMap;
 use std::fs;
@@ -257,7 +257,9 @@ impl VideoPlayerState {
             .clip
             .frame_at_ms(self.current_ms)
             .or_else(|| self.clip.poster_frame())?;
-        let mut img = Image::from_rgba(frame.width, frame.height, frame.rgba.clone()).ok()?;
+        let rgba = anvil_gpu::composite_rgba_frame(frame.width, frame.height, &frame.rgba)
+            .unwrap_or_else(|| frame.rgba.clone());
+        let mut img = Image::from_rgba(frame.width, frame.height, rgba).ok()?;
         overlay_video_controls_hud(&mut img, self.playing, self.current_ms, self.duration_ms);
         Some(img)
     }
@@ -2716,9 +2718,9 @@ mod tests {
     use anvil_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.18`.
+    /// `VERSION` is the string `v.19`.
     fn release_is_v18() {
-        assert_eq!(VERSION, "v.18");
+        assert_eq!(VERSION, "v.19");
     }
 
     #[test]

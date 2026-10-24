@@ -29,7 +29,7 @@ namespace anvil_vm {
 // 1. Deterministic Engine Limits & Budgets
 // ============================================================================
 
-constexpr u32 ANVIL_VM_KERNEL_VERSION    = 16u;
+constexpr u32 ANVIL_VM_KERNEL_VERSION    = 17u;
 constexpr u32 MAX_VM_STEPS              = 100000u;
 constexpr u32 MAX_CALL_FRAMES           = 64u;
 constexpr u32 MAX_REGISTERS_PER_FRAME   = 64u;
@@ -560,6 +560,7 @@ struct AnvilVmTelemetryC {
     u32 ic_misses;
     u32 polymorphic_ic_sites;
     u32 hot_loops_accelerated;
+    u32 native_compilations;
 };
 
 struct AnvilVmContext {
@@ -573,6 +574,7 @@ struct AnvilVmContext {
     u32 frame_count;
     u32 steps_executed;
     u32 hot_loops_accelerated;
+    u32 native_compilations;
     bool aborted;
 
     void init() noexcept;
@@ -580,6 +582,11 @@ struct AnvilVmContext {
     AnvilValue execute(u32 entry_pc = 0u) noexcept;
     void fill_telemetry(AnvilVmTelemetryC* out) const noexcept;
 };
+
+// Compile a numeric program to x86-64 and run it. Returns false when the
+// program is not numeric or the code page cannot be executed. On success,
+// `out_number` is the Halt/Return value.
+bool anvil_jit_try_run(AnvilVmContext* ctx, u32 entry_pc, f64* out_number) noexcept;
 
 // Compile source text into `ctx.program`. `compiler_memory` is caller-owned
 // storage of `anvil_cpp_vm_compiler_bytes` bytes. This is not a general compiler.

@@ -86,6 +86,7 @@ void AnvilVmContext::init() noexcept {
     frame_count = 0u;
     steps_executed = 0u;
     hot_loops_accelerated = 0u;
+    native_compilations = 0u;
     aborted = false;
 }
 
@@ -106,6 +107,12 @@ u16 AnvilVmContext::resolve_global_slot(u32 name_sym) noexcept {
 }
 
 AnvilValue AnvilVmContext::execute(u32 entry_pc) noexcept {
+    f64 native_out = 0.0;
+    if (anvil_jit_try_run(this, entry_pc, &native_out)) {
+        ++native_compilations;
+        return AnvilValue::make_number(native_out);
+    }
+
     u32 pc = entry_pc;
     u32 reg_base = 0u;
     frame_count = 0u;
@@ -449,6 +456,7 @@ void AnvilVmContext::fill_telemetry(AnvilVmTelemetryC* out) const noexcept {
     out->ic_misses = ic.ic_misses + ic.dom_ic_misses;
     out->polymorphic_ic_sites = ic.polymorphic_upgrades;
     out->hot_loops_accelerated = hot_loops_accelerated;
+    out->native_compilations = native_compilations;
 }
 
 } // namespace anvil_vm
@@ -549,6 +557,47 @@ u32 anvil_cpp_vm_run_script(
     if (ctx.aborted) {
         return 2u;
     }
+    return 1u;
+}
+
+// Copy one numeric global out of a context left by anvil_cpp_vm_run_script.
+// Returns 1 when `index` is occupied and holds a number.
+extern "C" u32 anvil_cpp_vm_global_count(void* context_memory) noexcept {
+    if (!context_memory) {
+        return 0u;
+    }
+    const auto& ctx = *static_cast<const anvil_vm::AnvilVmContext*>(context_memory);
+    return ctx.global_count;
+}
+
+extern "C" u32 anvil_cpp_vm_copy_global(
+    void* context_memory,
+    u32 index,
+    char* name_out,
+    u32 name_cap,
+    f64* value_out
+) noexcept {
+    if (!context_memory || !name_out || name_cap < 2u || !value_out) {
+        return 0u;
+    }
+    const auto& ctx = *static_cast<const anvil_vm::AnvilVmContext*>(context_memory);
+    if (index >= ctx.global_count || !ctx.globals[index].occupied) {
+        return 0u;
+    }
+    if (!ctx.globals[index].value.is_number()) {
+        return 0u;
+    }
+    u32 len = 0u;
+    const char* text = ctx.heap.get_string_ptr(ctx.globals[index].name_sym, &len);
+    if (!text || len == 0u) {
+        return 0u;
+    }
+    const u32 n = (len < name_cap - 1u) ? len : (name_cap - 1u);
+    for (u32 i = 0u; i < n; ++i) {
+        name_out[i] = text[i];
+    }
+    name_out[n] = '\0';
+    *value_out = ctx.globals[index].value.as_number();
     return 1u;
 }
 

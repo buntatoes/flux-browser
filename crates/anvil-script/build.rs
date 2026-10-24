@@ -20,6 +20,7 @@ const CPP_UNITS: &[(&str, &str)] = &[
     ("cpp/anvil_vm_ic.cpp", "anvil_vm_ic"),
     ("cpp/anvil_vm_compiler.cpp", "anvil_vm_compiler"),
     ("cpp/anvil_jit_accel.cpp", "anvil_jit_accel"),
+    ("cpp/anvil_jit_native.cpp", "anvil_jit_native"),
 ];
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
