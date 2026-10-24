@@ -16,7 +16,7 @@ use crate::SearchEngine;
 use anvil_gpu::sdf_rounded_box;
 use anvil_image::{Image, decode_png, encode_ico, encode_png};
 
-/// Embedded 128x128 PNG bytes of the Anvil Browser brand logo (`assets/anvil-logo.png`).
+/// Embedded 512x512 PNG bytes of the Anvil Browser brand logo (`assets/anvil-logo.png`).
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/anvil-logo.png");
 
 /// Decode `LOGO_PNG_BYTES` once and fade pixels outside a rounded rectangle.
