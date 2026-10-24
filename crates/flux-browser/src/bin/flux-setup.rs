@@ -1,11 +1,17 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
-//! Standalone Flux Browser Self-Extracting Setup & Uninstaller (`flux-setup`).
+//! Setup and uninstall binary (`flux-setup`).
 //!
-//! Supports:
-//! - Interactive Windows Setup Wizard (`flux-setup.exe` / `FluxBrowser-Setup-v.11-win64.exe`)
-//! - Unattended silent installation (`flux-setup --silent` or `/S`)
-//! - Self-extracting single-file bundler (`flux-setup --pack <setup.exe> <flux.exe> <out.exe>`)
-//! - Uninstaller (`flux-setup --uninstall`)
+//! `main` reads argv and calls `installer::install_default`, `uninstall_default`,
+//! or `pack_sfx_installer`. The pack path uses `flux-compress` inside that
+//! installer function. Windows message boxes come from `user32` in this file.
+//!
+//! Flags this binary actually accepts:
+//! - no command: install
+//! - `--silent`, `/S`, `-s`, `/quiet`: install or uninstall without message boxes
+//! - `--uninstall`, `uninstall`, `/uninstall`: uninstall
+//! - a file name containing `uninstall`: uninstall, even with no command flag
+//! - `--pack <setup stub> <browser exe> <output exe>`: append a compressed trailer
+//! - `--help`, `-h`, `help`: print the command list
 
 use std::env;
 use std::fs;
@@ -16,24 +22,36 @@ use flux_browser::installer::{
     default_install_dir, install_default, pack_sfx_installer, uninstall_default,
 };
 
+/// Windows message-box flags and the `MessageBoxW` call used by the wizard prompts.
 #[cfg(windows)]
 mod win_dialog {
     use std::ffi::c_void;
     use std::ptr::null_mut;
 
+    /// `MessageBoxW` style: one OK button.
     pub const MB_OK: u32 = 0x0000_0000;
+    /// `MessageBoxW` style: OK and Cancel.
     pub const MB_OKCANCEL: u32 = 0x0000_0001;
+    /// `MessageBoxW` style: Yes, No, and Cancel.
     pub const MB_YESNOCANCEL: u32 = 0x0000_0003;
+    /// `MessageBoxW` style: Yes and No.
     pub const MB_YESNO: u32 = 0x0000_0004;
+    /// `MessageBoxW` icon: error.
     pub const MB_ICONERROR: u32 = 0x0000_0010;
+    /// `MessageBoxW` icon: question.
     pub const MB_ICONQUESTION: u32 = 0x0000_0020;
+    /// `MessageBoxW` icon: information.
     pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
+    /// `MessageBoxW` return: OK.
     pub const IDOK: i32 = 1;
+    /// `MessageBoxW` return: Yes.
     pub const IDYES: i32 = 6;
+    /// `MessageBoxW` return: No.
     pub const IDNO: i32 = 7;
 
     #[link(name = "user32")]
     unsafe extern "system" {
+        /// Win32 message box. `message_box` is the only caller.
         fn MessageBoxW(
             h_wnd: *mut c_void,
             lp_text: *const u16,
@@ -44,9 +62,11 @@ mod win_dialog {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        /// Attach this process to a console. `main` passes the parent-process id.
         pub fn AttachConsole(dw_process_id: u32) -> i32;
     }
 
+    /// Show a UTF-16 message box and return the button id.
     pub fn message_box(title: &str, body: &str, flags: u32) -> i32 {
         let w_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
         let w_body: Vec<u16> = body.encode_utf16().chain(std::iter::once(0)).collect();
@@ -54,6 +74,7 @@ mod win_dialog {
     }
 }
 
+/// Dispatch pack, uninstall, help, or install. Silent flags skip the Windows prompts.
 fn main() -> ExitCode {
     #[cfg(windows)]
     unsafe {
@@ -72,6 +93,7 @@ fn main() -> ExitCode {
         .is_some_and(|name| name.contains("uninstall"));
 
     match args.first().map(String::as_str) {
+        // Read two binaries and write `[stub][zlib(browser)][length][FLUXSFX1]`.
         Some("--pack") => {
             if args.len() != 4 {
                 eprintln!("Usage: flux-setup --pack <setup_stub.exe> <flux.exe> <output.exe>");
@@ -104,6 +126,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("--uninstall" | "uninstall" | "/uninstall") => run_uninstall(silent),
+        // Print the flag list and exit success.
         Some("--help" | "-h" | "help") => {
             println!("Flux Browser Setup & Uninstaller {VERSION} (Author: Buntos)");
             println!("  flux-setup              Interactive setup wizard (installs Flux Browser)");
@@ -112,11 +135,14 @@ fn main() -> ExitCode {
             println!("  flux-setup --pack <s> <f> <o>  Bundle single-file SFX installer");
             ExitCode::SUCCESS
         }
+        // The executable name itself contains "uninstall".
         _ if invoked_as_uninstaller => run_uninstall(silent),
+        // Any other argv, including none, installs.
         _ => run_install(silent),
     }
 }
 
+/// Ask before uninstall on Windows unless `silent` is set, then call `uninstall_default`.
 fn run_uninstall(silent: bool) -> ExitCode {
     #[cfg(windows)]
     if !silent {
@@ -177,6 +203,11 @@ fn run_uninstall(silent: bool) -> ExitCode {
     }
 }
 
+/// Ask before install on Windows unless `silent` is set, then call `install_default`.
+///
+/// If `flux.exe` is already in the default directory, Yes reinstalls, No uninstalls,
+/// and Cancel returns success without changing files. After a successful install the
+/// Yes button on the last prompt spawns the installed binary. Silent mode skips both prompts.
 fn run_install(silent: bool) -> ExitCode {
     #[cfg(windows)]
     if !silent {

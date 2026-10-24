@@ -1,3 +1,7 @@
+# HTML tree only. Records img and video URLs for later crates.
+# Does not decode pixels and does not depend on flux-image or flux-video.
+# flux-style and flux-layout consume the tree. flux-script mutates it.
+
 [package]
 name = "flux-dom"
 description = "HTML tree, selectors, and form fields."

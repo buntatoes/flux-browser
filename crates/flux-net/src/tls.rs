@@ -1,8 +1,31 @@
-//! TLS on top of a TCP socket.
-//! Windows uses Schannel. Linux uses OpenSSL.
+//! TLS for one already-connected TCP socket.
+//!
+//! Windows uses Schannel (`secur32`). Certificate verification is on:
+//! `SCH_CRED_AUTO_CRED_VALIDATION` asks Schannel to validate the server
+//! certificate. This file does not set manual validation and does not disable
+//! the check. Linux uses OpenSSL `libssl` and `libcrypto`. Verification is on:
+//! `SSL_VERIFY_PEER`, the default CA paths, a hostname check, and
+//! `SSL_get_verify_result` must be `X509_V_OK`. The minimum protocol requested
+//! on Linux is TLS 1.2.
+//!
+//! [`https_exchange`] is called from `http_exchange` after `TcpStream::connect`.
+//! It writes one HTTP/1.1 request and reads until the peer closes, the read
+//! times out with bytes already buffered, or the raw buffer would pass
+//! `max_response`. There is no session resumption and no connection pool.
+//! Renegotiation on Windows stops the read instead of continuing the handshake.
+//! Other operating systems have no implementation. The caller returns
+//! `UnsupportedScheme` for `https` there.
+//!
+//! `build.rs` only searches for the Linux libraries. A missing library warns
+//! and does not fail that script. The link names are declared in this file.
 
 #[cfg(windows)]
 mod imp {
+    //! Schannel client for one socket.
+    //!
+    //! Certificate verification is on through `SCH_CRED_AUTO_CRED_VALIDATION`.
+    //! No client certificate is sent. The decrypted body is capped by `max_response`.
+
     use std::ffi::c_void;
     use std::io::{Error, ErrorKind, Read, Write};
     use std::net::TcpStream;
@@ -12,8 +35,11 @@ mod imp {
 
     const SECPKG_CRED_OUTBOUND: u32 = 0x0000_0002;
     const SCHANNEL_CRED_VERSION: u32 = 4;
+    // Do not send a client certificate.
     const SCH_CRED_NO_DEFAULT_CREDS: u32 = 0x0000_0010;
+    // Certificate verification is on. Schannel validates the server certificate.
     const SCH_CRED_AUTO_CRED_VALIDATION: u32 = 0x0000_0020;
+    // Refuse known weak algorithms. Protocol versions are left at the Schannel default.
     const SCH_USE_STRONG_CRYPTO: u32 = 0x0040_0000;
 
     const ISC_REQ_REPLAY_DETECT: u32 = 0x0000_0004;
@@ -98,6 +124,10 @@ mod imp {
         cb_block_size: u32,
     }
 
+    // Schannel entry points from secur32. Certificate checks stay on.
+    // AcquireCredentialsHandleW loads the credential. InitializeSecurityContextW
+    // runs the handshake. EncryptMessage and DecryptMessage wrap application
+    // data. The three Free/Delete calls run from TlsGuards on drop.
     #[link(name = "secur32")]
     unsafe extern "system" {
         fn AcquireCredentialsHandleW(
@@ -152,6 +182,7 @@ mod imp {
         fn FreeCredentialsHandle(ph_credential: *mut SecHandle) -> i32;
     }
 
+    /// Frees the Schannel context and credential handle on drop, including on error.
     struct TlsGuards {
         cred: SecHandle,
         has_cred: bool,
@@ -172,6 +203,13 @@ mod imp {
         }
     }
 
+    /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
+    ///
+    /// `max_response` caps the decrypted plaintext. Exceeding it returns
+    /// [`NetError::BodyTooLarge`] and does not return a partial body.
+    /// The socket timeouts are whatever the caller set. A timeout or `WouldBlock`
+    /// with no plaintext yet is an I/O error. The same condition after some
+    /// plaintext stops the read and returns what was decrypted.
     pub fn https_exchange(
         mut stream: TcpStream,
         host: &str,
@@ -193,6 +231,7 @@ mod imp {
             dw_minimum_cipher_strength: 0,
             dw_maximum_cipher_strength: 0,
             dw_session_lifespan: 0,
+            // Verification stays on. No client certificate. Strong crypto required.
             dw_flags: SCH_CRED_NO_DEFAULT_CREDS
                 | SCH_CRED_AUTO_CRED_VALIDATION
                 | SCH_USE_STRONG_CRYPTO,
@@ -226,6 +265,8 @@ mod imp {
         guards.has_cred = true;
 
         let mut in_buf = Vec::<u8>::new();
+        // Replay and sequence detection, confidentiality, and a stream handshake.
+        // Supplied creds means no user prompt for a client certificate.
         let flags = ISC_REQ_SEQUENCE_DETECT
             | ISC_REQ_REPLAY_DETECT
             | ISC_REQ_CONFIDENTIALITY
@@ -325,6 +366,8 @@ mod imp {
                 }
             }
 
+            // SEC_E_OK ends the handshake. Schannel has already applied auto validation.
+            // Any other status except SEC_I_CONTINUE_NEEDED fails the handshake.
             if status == SEC_E_OK {
                 break;
             }
@@ -464,6 +507,7 @@ mod imp {
                                 b.cb_buffer as usize,
                             )
                         };
+                        // Cap the decrypted bytes. This is the same limit as the cleartext read.
                         if plain.len() + slice.len() > max_response {
                             return Err(NetError::BodyTooLarge);
                         }
@@ -482,6 +526,7 @@ mod imp {
                     }
                 }
                 in_buf = extra_slice.unwrap_or_default();
+                // Renegotiation is not completed. The bytes already decrypted are returned.
                 if status == SEC_I_RENEGOTIATE {
                     break;
                 }
@@ -506,6 +551,8 @@ mod imp {
         Ok(plain)
     }
 
+    /// Read one socket chunk into `buf` during the handshake.
+    /// A zero read is an unexpected close, not a clean end.
     fn read_more(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), NetError> {
         let mut chunk = [0_u8; 4096];
         let n = stream.read(&mut chunk).map_err(NetError::Io)?;
@@ -519,10 +566,12 @@ mod imp {
         Ok(())
     }
 
+    /// Wrap a Schannel status as [`NetError::Io`]. `code` is printed as eight hex digits.
     fn tls_err(context: &str, code: i32) -> NetError {
         NetError::Io(Error::other(format!("{context} (0x{:08x})", code as u32)))
     }
 
+    /// UTF-16 string with a trailing NUL for the wide Schannel calls.
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
@@ -530,6 +579,12 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
+    //! OpenSSL client for one socket.
+    //!
+    //! Certificate verification is on. `SSL_VERIFY_PEER` is set, the default CA
+    //! paths are loaded, and `SSL_get_verify_result` must be `X509_V_OK` before
+    //! the HTTP request is written. The plaintext is capped by `max_response`.
+
     use std::ffi::{CString, c_char, c_int, c_long, c_void};
     use std::io::Error;
     use std::net::TcpStream;
@@ -538,13 +593,19 @@ mod imp {
 
     use crate::NetError;
 
+    // Peer certificate verification is on. There is no verify callback that accepts failures.
     const SSL_VERIFY_PEER: c_int = 0x01;
     const SSL_CTRL_SET_TLSEXT_HOSTNAME: c_int = 55;
     const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
     const TLSEXT_NAMETYPE_HOST_NAME: c_long = 0;
+    // TLS 1.2 is the minimum. Newer versions remain available through the client method.
     const TLS1_2_VERSION: c_long = 0x0303;
     const X509_V_OK: c_long = 0;
 
+    // OpenSSL symbols. build.rs only adds the library search path.
+    // These declarations are what rustc links as ssl and crypto.
+    // TLS_client_method through SSL_connect perform the handshake.
+    // SSL_write and SSL_read move the HTTP bytes. SSL_shutdown runs on drop.
     #[link(name = "ssl")]
     #[link(name = "crypto")]
     unsafe extern "C" {
@@ -571,6 +632,7 @@ mod imp {
         fn SSL_shutdown(ssl: *mut c_void) -> c_int;
     }
 
+    /// Shuts down and frees the SSL session, then frees the context, on drop.
     struct OpenSslGuard {
         ctx: *mut c_void,
         ssl: *mut c_void,
@@ -590,6 +652,14 @@ mod imp {
         }
     }
 
+    /// Handshake with `host`, write `request`, and return the raw HTTP bytes.
+    ///
+    /// Verification is on. The system CA paths must load, `SSL_connect` must
+    /// succeed, and `SSL_get_verify_result` must be `X509_V_OK`. A failed
+    /// certificate check returns an I/O error and no body. `max_response` caps
+    /// the plaintext. A short read (`SSL_read` <= 0) ends the response, including
+    /// a clean close. The hostname set and the SNI control return values are
+    /// ignored. If either call fails, the later verify result is still checked.
     pub fn https_exchange(
         stream: TcpStream,
         host: &str,
@@ -622,6 +692,7 @@ mod imp {
                     "could not load system CA certificate paths",
                 )));
             }
+            // Verification is on. The null callback keeps OpenSSL's default check.
             SSL_CTX_set_verify(guard.ctx, SSL_VERIFY_PEER, null_mut());
             let _ = SSL_CTX_ctrl(
                 guard.ctx,
@@ -646,6 +717,7 @@ mod imp {
 
             let param = SSL_get0_param(guard.ssl);
             if !param.is_null() {
+                // Hostname check. A failed set is ignored here; verify_result is still required.
                 let _ = X509_VERIFY_PARAM_set1_host(param, host_c.as_ptr(), host.len());
             }
 
@@ -659,6 +731,7 @@ mod imp {
                 return Err(NetError::Io(Error::other("OpenSSL TLS handshake failed")));
             }
 
+            // Certificate verification is on. A non-OK result aborts before any HTTP write.
             if SSL_get_verify_result(guard.ssl) != X509_V_OK {
                 return Err(NetError::Io(Error::other(
                     "TLS peer certificate verification failed",
@@ -691,6 +764,7 @@ mod imp {
                     break;
                 }
                 let count = n as usize;
+                // Cap the decrypted bytes. A larger response is not returned in part.
                 if plain.len() + count > max_response {
                     return Err(NetError::BodyTooLarge);
                 }
@@ -701,4 +775,5 @@ mod imp {
     }
 }
 
+/// TLS exchange for the current target. Windows or Linux only.
 pub use imp::https_exchange;

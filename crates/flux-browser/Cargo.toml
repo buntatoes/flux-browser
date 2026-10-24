@@ -1,3 +1,12 @@
+# Application crate. Two binaries: `flux` (window, headless raster, --tab-worker)
+# and `flux-setup` (packaged setup). Calls every engine crate plus the siblings
+# listed below.
+# flux-cipher is a non-Windows dependency only. Linux profile.flx is AES-256-GCM.
+# Windows profile.flx is DPAPI and does not link flux-cipher.
+# flux-compress wraps the profile snapshot and the setup payload.
+# flux-gpu, flux-image, flux-json, flux-ttf, and flux-video are used by the
+# session directly as well as by the engine crates.
+
 [package]
 name = "flux-browser"
 description = "Window, pages, downloads, and the profile file."

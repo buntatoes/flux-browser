@@ -1,8 +1,12 @@
-//! Hardened Download Manager, SHA-256 Integrity Verifier, and Safe File Quarantine (`flux://downloads`).
+//! Download log used by `Session` and the `flux://downloads` page.
 //!
-//! Computes FIPS 180-4 SHA-256 checksums on every downloaded payload, sanitizes untrusted file names
-//! against path traversal, quarantines potentially dangerous executable extensions, and tags saved
-//! files on Windows with the Mark-of-the-Web (`Zone.Identifier`) security stream.
+//! `profile.rs` stores the log inside the profile JSON through `to_json_value`.
+//! Digests come from `flux_net::sha256_digest`. Names are reduced to a short
+//! ASCII file name. Extensions in `QUARANTINED_EXTENSIONS` are marked
+//! quarantined and, when saved, written with a `.quarantined` suffix. They are
+//! still written. Windows saves also try to add a `Zone.Identifier` stream.
+//! Other targets do not write that stream. `motw_tagged` is set true on the
+//! record even when no file is written.
 
 use std::fs;
 use std::io;
@@ -17,6 +21,7 @@ pub const MAX_DOWNLOAD_ENTRIES: usize = 128;
 /// Maximum single download payload size (`64 MiB`).
 pub const MAX_SINGLE_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
 
+/// Extensions that `is_quarantined_extension` treats as executable or script names.
 const QUARANTINED_EXTENSIONS: &[&str] = &[
     "exe", "bat", "cmd", "ps1", "scr", "vbs", "js", "msi", "com", "dll", "hta", "reg",
 ];
@@ -33,6 +38,7 @@ pub enum DownloadState {
 }
 
 impl DownloadState {
+    /// Short status text shown on the downloads page.
     pub fn label(&self) -> &'static str {
         match self {
             DownloadState::VerifiedSafe => "VERIFIED SAFE",
@@ -41,6 +47,7 @@ impl DownloadState {
         }
     }
 
+    /// Stable state name stored in profile JSON. The `Failed` message is not stored.
     pub fn code(&self) -> &'static str {
         match self {
             DownloadState::VerifiedSafe => "verified",
@@ -53,13 +60,21 @@ impl DownloadState {
 /// Metadata and cryptographic integrity record for a single downloaded file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DownloadEntry {
+    /// Id assigned by `DownloadManager`. Restored rows keep the stored id.
     pub id: u64,
+    /// Sanitized file name, without a directory.
     pub file_name: String,
+    /// URL passed by the caller. Not fetched by this module.
     pub source_url: String,
+    /// Caller-supplied type, or `application/octet-stream` when blank.
     pub mime_type: String,
+    /// Payload length in bytes, including payloads that were rejected for size.
     pub byte_size: usize,
+    /// Lowercase SHA-256 hex, or the literal `exceeded-64mib-cap` when the payload is too large.
     pub sha256_hex: String,
+    /// Set true by `record_download`. It does not mean a zone stream was written.
     pub motw_tagged: bool,
+    /// Safe, quarantined, or failed.
     pub state: DownloadState,
 }
 
@@ -71,6 +86,7 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
+    /// Empty log. The next id is 1.
     pub fn new() -> Self {
         Self {
             next_id: 1,
@@ -78,23 +94,31 @@ impl DownloadManager {
         }
     }
 
+    /// Number of retained entries, at most `MAX_DOWNLOAD_ENTRIES`.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when `len` is zero.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Entries in insertion order. The oldest entry is first.
     pub fn entries(&self) -> &[DownloadEntry] {
         &self.entries
     }
 
+    /// Drop every entry. The next id is left unchanged.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
-    /// Record and verify an in-memory download payload, computing its SHA-256 digest and quarantine status.
+    /// Record an in-memory payload. This function does not fetch or write a file.
+    ///
+    /// Payloads larger than `MAX_SINGLE_DOWNLOAD_BYTES` are stored as `Failed`
+    /// and are not hashed. Other payloads are hashed. A quarantined extension
+    /// sets `QuarantinedExecutable` and still keeps the digest.
     pub fn record_download(
         &mut self,
         source_url: &str,
@@ -151,6 +175,7 @@ impl DownloadManager {
         entry
     }
 
+    /// Append `entry`, dropping the oldest row when the log is already full.
     fn push_entry(&mut self, entry: DownloadEntry) {
         if self.entries.len() >= MAX_DOWNLOAD_ENTRIES {
             self.entries.remove(0);
@@ -158,7 +183,11 @@ impl DownloadManager {
         self.entries.push(entry);
     }
 
-    /// Write a verified download payload to `target_dir` and apply the Windows Mark-of-the-Web (`Zone.Identifier`).
+    /// Record `payload`, then write it under `target_dir` when the state is not `Failed`.
+    ///
+    /// A quarantined name is saved as `<name>.quarantined`. `apply_mark_of_the_web`
+    /// runs after the write. A size failure returns `InvalidData` after the failed
+    /// row is already in the log.
     pub fn save_payload_to_dir(
         &mut self,
         source_url: &str,
@@ -183,6 +212,7 @@ impl DownloadManager {
         Ok((entry, dest))
     }
 
+    /// JSON array of entries. `state` is the code from `DownloadState::code`.
     pub fn to_json_value(&self) -> JsonValue {
         let mut arr = JsonValue::empty_array();
         for item in &self.entries {
@@ -200,6 +230,10 @@ impl DownloadManager {
         arr
     }
 
+    /// Rebuild a log from a JSON array. Rows without `file_name` are skipped.
+    ///
+    /// At most `MAX_DOWNLOAD_ENTRIES` rows are kept. A `failed` state comes back
+    /// as `Failed("restored failed state")` because the original message is not stored.
     pub fn from_json_array(items: &[JsonValue]) -> Self {
         let mut mgr = Self::new();
         for item in items.iter().take(MAX_DOWNLOAD_ENTRIES) {
@@ -262,6 +296,7 @@ pub fn sanitize_download_filename(raw: &str) -> String {
     }
 }
 
+/// True when the text after the last dot is one of `QUARANTINED_EXTENSIONS`.
 pub fn is_quarantined_extension(file_name: &str) -> bool {
     let lower = file_name.trim().to_ascii_lowercase();
     let Some((_, ext)) = lower.rsplit_once('.') else {
@@ -270,6 +305,7 @@ pub fn is_quarantined_extension(file_name: &str) -> bool {
     QUARANTINED_EXTENSIONS.contains(&ext)
 }
 
+/// Last path segment of `url`, or `download.bin` when that segment has no dot.
 fn infer_filename_from_url(url: &str) -> &str {
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
     let last = without_query.rsplit('/').next().unwrap_or("download.bin");
@@ -280,7 +316,9 @@ fn infer_filename_from_url(url: &str) -> &str {
     }
 }
 
+/// Lowercase hex for a 32-byte digest. The result is 64 characters.
 fn hex_encode_32(digest: &[u8; 32]) -> String {
+    /// Lowercase hex digits, index by nibble.
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(64);
     for &b in digest {
@@ -290,6 +328,10 @@ fn hex_encode_32(digest: &[u8; 32]) -> String {
     out
 }
 
+/// On Windows, write a `Zone.Identifier` stream with `ZoneId=3` beside `file_path`.
+///
+/// Newlines in `source_url` are dropped and the URL is capped at 256 characters.
+/// A failed write is ignored. On other targets this function does nothing.
 fn apply_mark_of_the_web(file_path: &Path, source_url: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -312,9 +354,11 @@ fn apply_mark_of_the_web(file_path: &Path, source_url: &str) {
 
 #[cfg(test)]
 mod tests {
+    //! Filename cleanup, the extension list, and one safe versus one quarantined record.
     use super::*;
 
     #[test]
+    /// Strip a traversal prefix, hash a JSON payload, and mark an exe name quarantined.
     fn sanitizes_filenames_verifies_sha256_and_quarantines_executables() {
         assert_eq!(
             sanitize_download_filename("../../Windows/System32/cmd.exe"),

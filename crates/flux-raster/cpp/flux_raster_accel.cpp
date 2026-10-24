@@ -1,95 +1,22 @@
-// Scanline helpers for the Flux framebuffer: color swap, rect fill, rounded rects.
+// CPU scanline helpers for the flux-raster framebuffer.
 // Author: Buntos
 // License: Apache-2.0
+//
+// Compiled alongside flux_raster_compositor.cpp by crates/flux-raster/build.rs
+// when a C++20 compiler is on PATH, setting cfg(flux_cpp_accel).
 
-using u8 = unsigned char;
-using u16 = unsigned short;
-using u32 = unsigned int;
-using i32 = int;
+#include "flux_raster_accel.hpp"
 
-namespace {
-
-inline float f_abs(float v) noexcept {
-    return v < 0.0f ? -v : v;
-}
-
-inline float f_max(float a, float b) noexcept {
-    return a > b ? a : b;
-}
-
-inline float f_min(float a, float b) noexcept {
-    return a < b ? a : b;
-}
-
-inline float f_clamp(float v, float lo, float hi) noexcept {
-    return v < lo ? lo : (v > hi ? hi : v);
-}
-
-inline float f_sqrt(float x) noexcept {
-    if (x <= 0.0f) {
-        return 0.0f;
-    }
-    float guess = x > 1.0f ? x * 0.5f : 1.0f;
-    for (int i = 0; i < 6; ++i) {
-        guess = 0.5f * (guess + x / guess);
-    }
-    return guess;
-}
-
-inline float sdf_rounded_box_cpp(
-    float px,
-    float py,
-    float half_w,
-    float half_h,
-    float radius
-) noexcept {
-    const float r = f_clamp(radius, 0.0f, f_min(half_w, half_h));
-    const float qx = f_abs(px) - (half_w - r);
-    const float qy = f_abs(py) - (half_h - r);
-    const float ox = f_max(qx, 0.0f);
-    const float oy = f_max(qy, 0.0f);
-    const float outside = f_sqrt(ox * ox + oy * oy);
-    const float inside = f_min(f_max(qx, qy), 0.0f);
-    return outside + inside - r;
-}
-
-inline void blend_pixel_rgba(
-    u8* pixels,
-    u32 fb_width,
-    u32 px,
-    u32 py,
-    u8 r,
-    u8 g,
-    u8 b,
-    u8 a
-) noexcept {
-    if (a == 0) {
-        return;
-    }
-    const u32 offset = (py * fb_width + px) * 4u;
-    if (a == 255) {
-        pixels[offset] = r;
-        pixels[offset + 1] = g;
-        pixels[offset + 2] = b;
-        pixels[offset + 3] = 255;
-        return;
-    }
-    const u16 alpha = static_cast<u16>(a);
-    const u16 inv = static_cast<u16>(255u - alpha);
-    pixels[offset] = static_cast<u8>((static_cast<u16>(r) * alpha + static_cast<u16>(pixels[offset]) * inv) / 255u);
-    pixels[offset + 1] = static_cast<u8>((static_cast<u16>(g) * alpha + static_cast<u16>(pixels[offset + 1]) * inv) / 255u);
-    pixels[offset + 2] = static_cast<u8>((static_cast<u16>(b) * alpha + static_cast<u16>(pixels[offset + 2]) * inv) / 255u);
-    pixels[offset + 3] = 255;
-}
-
-} // namespace
+using namespace flux_raster_cpp;
 
 extern "C" {
 
+// Rust accepts this object file only when the result is 16.
 u32 flux_cpp_raster_kernel_version() noexcept {
     return 16u;
 }
 
+// Top-down RGBA to bottom-up BGRA for a GDI DIB. Row 0 of dst is the last src row.
 void flux_cpp_rgba_to_bgra_bottom_up(
     const u8* src_rgba,
     u8* dst_bgra,
@@ -114,6 +41,7 @@ void flux_cpp_rgba_to_bgra_bottom_up(
     }
 }
 
+// Fill [x0, x1) by [y0, y1) in the RGBA buffer.
 void flux_cpp_fill_rect_rgba(
     u8* pixels,
     u32 fb_width,
@@ -153,6 +81,7 @@ void flux_cpp_fill_rect_rgba(
     }
 }
 
+// Fill a rounded rectangle, optionally mixing a border, into the RGBA buffer.
 void flux_cpp_fill_rounded_rect_sdf(
     u8* pixels,
     u32 fb_width,

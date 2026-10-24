@@ -1,3 +1,27 @@
+# Desktop browser workspace. Crate version 0.17.0. Not published.
+#
+# Page pipeline, in order:
+#   flux-dom parses HTML into one node list.
+#   flux-style computes the cascade for those nodes.
+#   flux-layout places boxes and measures text with flux-ttf.
+#   flux-paint records a display list and applies zoom.
+#   flux-raster fills a CPU framebuffer from that list (with C++20 scanline/SDF/compositor helpers).
+#
+# Beside that pipeline:
+#   flux-script runs a budgeted JS runtime and C++20 FluxVM register bytecode interpreter against the document and uses flux-json.
+#   flux-net loads HTTP and HTTPS documents and uses flux-compress and flux-json.
+#   flux-sandbox applies process limits. Ordinary pages still render in-process.
+#   flux-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
+#
+# The seven libraries under [workspace.dependencies] are separate repositories
+# that sit next to this directory. flux-cipher is linked only by flux-browser
+# on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
+# inside flux-browser and does not link flux-cipher.
+#
+# Apache-2.0: flux-dom, flux-style, flux-layout, flux-paint, flux-raster, flux-script.
+# LicenseRef-Proprietary: flux-net, flux-sandbox, flux-browser, frontend/, and the logo asset.
+# MPL-2.0: flux-cipher, flux-compress, flux-image, flux-json, flux-ttf, flux-gpu, flux-video.
+
 [workspace]
 resolver = "3"
 members = [
@@ -13,10 +37,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
-description = "Small desktop browser. HTML, CSS, layout, and a limited script interpreter."
+description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 FluxVM script runtime."
 license = "Apache-2.0 AND LicenseRef-Proprietary"
 repository = "https://github.com/buntatoes/flux-browser"
 publish = false

@@ -1,12 +1,31 @@
+//! HTML parser for [`crate::Document`].
+//!
+//! This is the front of the engine pipeline. Bytes become a node list that
+//! [`crate::Document`] owns. flux-style reads that tree next; this module
+//! does not compute style, layout, or pixels. flux-script may mutate the
+//! tree later, and flux-browser keeps the document.
+//!
+//! Image and video elements are stored as ordinary elements. Their `src`
+//! values are collected by the document so a later stage can decode images
+//! with flux-image and hand `<video>` to flux-video. This parser does not
+//! decode either, and this crate does not depend on those libraries.
+//!
+//! Caps, checked while scanning:
+//! - [`MAX_DOM_DEPTH`] (256) limits how deep the open-element stack grows.
+//! - [`MAX_DOM_NODES`] (50_000) stops allocation. Leftover input is ignored.
+//! - [`MAX_ATTRS_PER_ELEMENT`] (128) drops further attributes on one start tag.
+
 use crate::{Document, NodeId};
 
-/// Maximum DOM tree nesting depth enforced by the HTML parser to prevent stack overflows.
+/// Open-element stack limit. A start tag past this depth is still created,
+/// but it is not pushed, so following tokens stay under the current parent.
 pub const MAX_DOM_DEPTH: usize = 256;
 
-/// Maximum total DOM nodes allocated per document to prevent memory exhaustion.
+/// Node-list limit for one document, including text nodes created here.
+/// [`crate::Document::set_inner_html`] uses the same cap when cloning.
 pub const MAX_DOM_NODES: usize = 50_000;
 
-/// Maximum attributes accepted per HTML start tag.
+/// Attributes kept from one start tag. Later attributes on that tag are dropped.
 pub const MAX_ATTRS_PER_ELEMENT: usize = 128;
 
 const VOID_TAGS: &[&str] = &[
@@ -18,8 +37,14 @@ const HEAD_TAGS: &[&str] = &["base", "link", "meta", "style", "title"];
 
 /// Parse a subset of HTML into a document.
 ///
-/// `script` and `style` keep their raw text, including a `<` that would
-/// otherwise look like a tag. Void tags do not take children.
+/// `input` is borrowed for the scan. The returned [`Document`] owns every
+/// tag, attribute, and text string. `script` and `style` keep their raw text,
+/// including a `<` that would otherwise look like a tag. Void tags do not
+/// take children. Comments and `<!` / `<?` markup are skipped. Tag names are
+/// stored in ASCII lowercase. An unknown entity is left in the text.
+///
+/// The scan stops once [`MAX_DOM_NODES`] nodes exist. Nesting past
+/// [`MAX_DOM_DEPTH`] does not open a new stack frame.
 pub fn parse_html(input: &str) -> Document {
     let mut doc = Document::new();
     let mut stack = vec![doc.body()];
@@ -27,6 +52,7 @@ pub fn parse_html(input: &str) -> Document {
     let mut index = 0;
 
     while index < bytes.len() {
+        // The node list is not compacted. Hitting the cap drops the rest of the source.
         if doc.node_count() >= MAX_DOM_NODES {
             break;
         }
@@ -84,6 +110,8 @@ pub fn parse_html(input: &str) -> Document {
                 continue;
             }
 
+            // Depth is the open stack, which starts at `body`. A node past the
+            // cap is parented to the current top and does not become a frame.
             if !is_void(&name) && stack.len() < MAX_DOM_DEPTH {
                 stack.push(id);
             }
@@ -106,6 +134,7 @@ pub fn parse_html(input: &str) -> Document {
     doc
 }
 
+/// True when `<` begins a tag, comment, or declaration rather than text.
 fn is_markup(bytes: &[u8], index: usize) -> bool {
     matches!(
         bytes.get(index + 1).copied(),
@@ -113,10 +142,16 @@ fn is_markup(bytes: &[u8], index: usize) -> bool {
     )
 }
 
+/// Void tags never take children and are not pushed on the open stack.
 fn is_void(tag: &str) -> bool {
     VOID_TAGS.contains(&tag)
 }
 
+/// Pop implied end tags before a table cell, row, section, or `option`.
+///
+/// Only the open stack is changed. Already-built nodes stay where they are.
+/// Tags other than `td`, `th`, `tr`, `thead`, `tbody`, `tfoot`, and `option`
+/// do not auto-close anything.
 fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &str) {
     match new_tag {
         "td" | "th" => {
@@ -159,6 +194,10 @@ fn auto_close_for_start_tag(doc: &Document, stack: &mut Vec<NodeId>, new_tag: &s
     }
 }
 
+/// Parent for a new element. Head-only tags under `body` or `html` go to `head`.
+///
+/// An empty stack falls back to `body`. The returned id is copied from `stack`
+/// or from the document skeleton. It is not a newly allocated node.
 fn placement_parent(doc: &Document, stack: &[NodeId], tag: &str) -> NodeId {
     if HEAD_TAGS.contains(&tag) {
         if let Some(top) = stack.last() {
@@ -170,6 +209,10 @@ fn placement_parent(doc: &Document, stack: &[NodeId], tag: &str) -> NodeId {
     stack.last().copied().unwrap_or_else(|| doc.body())
 }
 
+/// Pop the open stack through the matching start tag.
+///
+/// `head`, `body`, and `html` reset the stack to `body`. An unknown name pops
+/// until the stack would be empty, then restores `body`. Nodes are not removed.
 fn close_tag(doc: &Document, stack: &mut Vec<NodeId>, name: &str) {
     if name.is_empty() {
         return;
@@ -190,6 +233,12 @@ fn close_tag(doc: &Document, stack: &mut Vec<NodeId>, name: &str) {
     }
 }
 
+/// Read a start tag at `start` (the `<` byte).
+///
+/// Returns the lowercase name, owned attribute pairs, and the index after `>`.
+/// A `/` before `>` is ignored, so a self-closing slash does not by itself make
+/// the tag void. Attribute values are entity-decoded. Past
+/// [`MAX_ATTRS_PER_ELEMENT`], further attributes are skipped.
 fn read_start_tag(input: &str, start: usize) -> (String, Vec<(String, String)>, usize) {
     let bytes = input.as_bytes();
     let mut index = start + 1;
@@ -217,6 +266,7 @@ fn read_start_tag(input: &str, start: usize) -> (String, Vec<(String, String)>, 
         } else {
             String::new()
         };
+        // Overflow attributes are discarded. The tag itself is still created.
         if attrs.len() < MAX_ATTRS_PER_ELEMENT {
             attrs.push((attr_name, value));
         }
@@ -227,6 +277,8 @@ fn read_start_tag(input: &str, start: usize) -> (String, Vec<(String, String)>, 
     (name, attrs, index)
 }
 
+/// Read an end tag at `start` (the `<` of `</`). Returns the lowercase name
+/// and the index after `>`, or the end of input when `>` is missing.
 fn read_end_tag(input: &str, start: usize) -> (String, usize) {
     let bytes = input.as_bytes();
     let mut index = start + 2;
@@ -240,6 +292,10 @@ fn read_end_tag(input: &str, start: usize) -> (String, usize) {
     (name, index)
 }
 
+/// Read a tag or attribute name and advance `index` past it.
+///
+/// The returned string is owned and ASCII-lowercased. Characters outside
+/// [`is_name_byte`] end the name.
 fn read_name(input: &str, index: &mut usize) -> String {
     let bytes = input.as_bytes();
     let start = *index;
@@ -249,10 +305,15 @@ fn read_name(input: &str, index: &mut usize) -> String {
     input[start..*index].to_ascii_lowercase()
 }
 
+/// ASCII alphanumeric, `-`, or `:`. Other bytes end a name.
 fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b':'
 }
 
+/// Read an attribute value and advance `index` past it.
+///
+/// Quoted values run to the matching quote. Unquoted values run to whitespace,
+/// `>`, or `/`. The result is owned and entity-decoded. A missing value is empty.
 fn read_attr_value(input: &str, index: &mut usize) -> String {
     let bytes = input.as_bytes();
     if *index >= bytes.len() {
@@ -280,6 +341,11 @@ fn read_attr_value(input: &str, index: &mut usize) -> String {
     decode_entities(&input[start..*index])
 }
 
+/// Take raw text until the case-insensitive end tag `</tag`.
+///
+/// Returns `None` when that end tag is absent; the caller then leaves the
+/// following source to the normal scanner. The text is owned and not parsed
+/// as markup. The end index is just after the end tag's `>`.
 fn read_raw_text(input: &str, start: usize, tag: &str) -> Option<(String, usize)> {
     let lower = input[start..].to_ascii_lowercase();
     let marker = format!("</{tag}");
@@ -296,18 +362,21 @@ fn read_raw_text(input: &str, start: usize, tag: &str) -> Option<(String, usize)
     Some((text, end))
 }
 
+/// Index just after `marker`, or `None` if `marker` does not occur.
 fn skip_until(input: &str, start: usize, marker: &str) -> Option<usize> {
     input[start..]
         .find(marker)
         .map(|offset| start + offset + marker.len())
 }
 
+/// Index just after the next `marker` character, or `None` if it does not occur.
 fn skip_char(input: &str, start: usize, marker: char) -> Option<usize> {
     input[start..]
         .find(marker)
         .map(|offset| start + offset + marker.len_utf8())
 }
 
+/// Advance `index` past ASCII whitespace. The returned index may be `bytes.len()`.
 fn skip_ascii_space(bytes: &[u8], mut index: usize) -> usize {
     while index < bytes.len() && bytes[index].is_ascii_whitespace() {
         index += 1;
@@ -315,6 +384,11 @@ fn skip_ascii_space(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
+/// Decode a fixed set of named entities into an owned string.
+///
+/// Recognized names: `amp`, `lt`, `gt`, `quot`, `apos`, `nbsp`. A `&` with no
+/// `;`, or any other name, is copied through. Numeric entities are not decoded.
+/// The input is borrowed; the output is owned.
 fn decode_entities(input: &str) -> String {
     let mut out = String::new();
     let mut rest = input;
@@ -347,7 +421,9 @@ fn decode_entities(input: &str) -> String {
 }
 
 /// Collapse whitespace, but keep one leading or trailing space when the
-/// source had it. A node that is only whitespace is dropped.
+/// source had it. A node that is only whitespace is dropped (`None`).
+///
+/// The returned string is owned. Interior whitespace runs become one space.
 fn normalize_text(raw: &str) -> Option<String> {
     if !raw.chars().any(|ch| !ch.is_whitespace()) {
         return None;

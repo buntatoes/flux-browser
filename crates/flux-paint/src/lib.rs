@@ -1,18 +1,47 @@
 //! Display list built from a laid-out box tree.
+//!
+//! Fourth stage of the pipeline. flux-layout has already placed boxes.
+//! This crate walks that tree into a z-ordered [`DisplayList`] and does not
+//! draw pixels. flux-raster consumes the list.
+//!
+//! Coordinates are borrowed from layout rects: origin at the top-left of the
+//! laid-out tree, x to the right, y downward. Lengths are CSS pixels.
+//!
+//! Paint order for each box is shadow, then background (gradient, rounded
+//! rect, or fill plus square borders), then a clip when overflow is hidden,
+//! then image and text, then children from low `z-index` to high. `position:
+//! fixed` wraps that range in [`DisplayItem::PushFixed`] / [`DisplayItem::PopFixed`].
+//!
+//! [`DisplayList::scaled`] multiplies lengths for zoom. Callers use 50%–250%
+//! (`0.5`–`2.5`). The clamp inside that method is wider (`0.25`–`4.0`).
+//! There is no node cap here; the list is as long as the box tree.
 
 use flux_layout::{Color, Image, LayoutBox, Overflow, Position};
 
+/// One painting command. Positions and sizes are CSS pixels, y downward.
+///
+/// Colors are copied. [`DisplayItem::Text`] and [`DisplayItem::Image`] own
+/// their text and image. Other variants store only numbers and colors.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisplayItem {
+    /// Intersect the current clip with this rectangle. Paired with [`Self::PopClip`].
+    /// The rectangle is the content box (border box inset by the border widths).
     PushClip {
         x: f32,
         y: f32,
         width: f32,
         height: f32,
     },
+    /// Remove the clip pushed by the matching [`Self::PushClip`].
     PopClip,
+    /// Mark the start of a `position: fixed` subtree. The rasterizer treats
+    /// items until [`Self::PopFixed`] as fixed to the viewport.
     PushFixed,
+    /// End the fixed layer opened by the matching [`Self::PushFixed`].
     PopFixed,
+    /// A shadow drawn before the box fill. `x`/`y`/`width`/`height` are the
+    /// border box. Offsets and blur are not applied here; they are stored for
+    /// the rasterizer. `radius` is the box corner radius.
     BoxShadow {
         x: f32,
         y: f32,
@@ -25,6 +54,9 @@ pub enum DisplayItem {
         radius: f32,
         color: Color,
     },
+    /// A two-stop linear gradient filling the border box. `angle_deg` is the
+    /// CSS angle (0 is up, 90 is right) and is not converted to a vector here.
+    /// `border_width` is the largest of the four border sides, not a per-side width.
     LinearGradientRect {
         x: f32,
         y: f32,
@@ -37,6 +69,7 @@ pub enum DisplayItem {
         end_color: Color,
         border_color: Color,
     },
+    /// An axis-aligned fill, also used for square border strips and underlines.
     Rect {
         x: f32,
         y: f32,
@@ -44,6 +77,8 @@ pub enum DisplayItem {
         height: f32,
         color: Color,
     },
+    /// A filled rounded rectangle. Used when `border-radius` is positive and
+    /// the box has no gradient. A zero-alpha fill still carries the border.
     RoundedRect {
         x: f32,
         y: f32,
@@ -54,6 +89,8 @@ pub enum DisplayItem {
         fill_color: Color,
         border_color: Color,
     },
+    /// An image painted in the content box. `image` is an owned clone.
+    /// `border_radius` is the box radius minus the top border, floored at 0.
     Image {
         x: f32,
         y: f32,
@@ -62,6 +99,8 @@ pub enum DisplayItem {
         border_radius: f32,
         image: Image,
     },
+    /// A text run. `x`/`y` is the top-left of the run in the layout's y-down
+    /// space. `text` is owned. The font size is in CSS pixels.
     Text {
         x: f32,
         y: f32,
@@ -71,14 +110,23 @@ pub enum DisplayItem {
     },
 }
 
+/// Owned sequence of [`DisplayItem`]s in paint order.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DisplayList {
     pub items: Vec<DisplayItem>,
 }
 
 impl DisplayList {
-    /// Return a scaled copy of this display list for viewport zoom (`0.5` to `2.5`).
+    /// Return a scaled copy of this display list.
+    ///
+    /// `scale` is a unitless zoom factor. Values outside `0.25`..=`4.0` are
+    /// clamped. A factor within epsilon of `1` returns a clone and does not
+    /// rescale. Lengths, radii, blur, spread, border width, and font size are
+    /// multiplied. Colors and gradient angles are copied. Text and images are
+    /// cloned. [`DisplayItem::PopClip`], [`DisplayItem::PushFixed`], and
+    /// [`DisplayItem::PopFixed`] are unchanged. The receiver is borrowed.
     pub fn scaled(&self, scale: f32) -> Self {
+        // Wider than the 50%–250% viewport zoom so a caller can probe the edges.
         let s = scale.clamp(0.25, 4.0);
         if (s - 1.0).abs() < f32::EPSILON {
             return self.clone();
@@ -213,12 +261,21 @@ impl DisplayList {
     }
 }
 
+/// Build an owned display list by walking `tree` in paint order.
+///
+/// `tree` is borrowed. Empty boxes (non-positive width or height) contribute
+/// no fill, shadow, or image. Children are still visited.
 pub fn paint(tree: &LayoutBox) -> DisplayList {
     let mut items = Vec::new();
     walk(tree, &mut items);
     DisplayList { items }
 }
 
+/// Append one box and its descendants. See the crate docs for paint order.
+///
+/// Child order is `(z_index, source index)` ascending, so a higher `z-index`
+/// paints later and ties keep tree order. The sort is not stable across equal
+/// keys beyond that index.
 fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
     let is_fixed = tree.position == Position::Fixed;
     if is_fixed {
@@ -301,6 +358,8 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
         paint_borders(tree, items);
     }
 
+    // Clip is the padding edge, y-down, and only when overflow is hidden.
+    // `scroll` and `auto` are already stored as hidden by flux-style.
     let is_clipped =
         tree.overflow == Overflow::Hidden && tree.rect.width > 0.0 && tree.rect.height > 0.0;
     if is_clipped {
@@ -336,6 +395,7 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
             color: run.color,
             font_size: run.font_size,
         });
+        // Underline sits below the run top, not on a font baseline.
         if run.underline && run.width > 0.0 {
             items.push(DisplayItem::Rect {
                 x: run.x,
@@ -359,6 +419,11 @@ fn walk(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
     }
 }
 
+/// Paint each positive border side as its own rectangle, in the box's y-down space.
+///
+/// Sides are top, bottom, left, right. A side thicker than the box is clamped
+/// to the box. Zero-area boxes are skipped. Corner overlaps are not mitered.
+/// Rounded boxes and gradients do not call this; they carry one border width.
 fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
     let b = tree.border;
     let r = tree.rect;
@@ -408,6 +473,8 @@ fn paint_borders(tree: &LayoutBox, items: &mut Vec<DisplayItem>) {
 
 #[cfg(test)]
 mod tests {
+    //! One box with a fill, four border strips, a text run, and an underline.
+
     use super::*;
     use flux_layout::{Edge, NodeId, Rect, TextRun};
 

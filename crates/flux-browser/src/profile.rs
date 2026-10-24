@@ -1,9 +1,20 @@
-//! Local profile file.
+//! `profile.flx` read and written by `Session` in `lib.rs`.
 //!
-//! Bookmarks, history, settings, tabs, and cookies are stored as JSON, then zlib.
-//! Windows seals that blob with DPAPI. Linux seals it with AES-256-GCM (`flux-cipher`).
-//! The Linux key is a 32-byte file named `profile.key` next to the profile, mode 0600.
-//! That file is written before the profile. Each directory has its own key.
+//! `snapshot_to_json` builds a `flux-json` object. `flux-compress` then zlib-wraps
+//! those bytes. `flux-net` supplies `CookieJar` and `HstsStore`, which are nested
+//! JSON values. `DownloadManager` is nested the same way.
+//!
+//! The snapshot stores `settings` (`gpu_video_acceleration`, `https_only_mode`,
+//! `scripts_enabled`, `jit_enabled`, `search_engine` slug), `zoom_percent`,
+//! `active_tab`, `tabs` as `{title, url}` pairs where `title` is a copy of the
+//! URL, `bookmarks`, `history`, `cookie_jar`, `hsts_store`, `downloads`, and
+//! origin-partitioned `local_storage` rows. `Session::apply_profile_snapshot`
+//! restores settings, zoom, bookmarks, history, cookies, HSTS, downloads, and
+//! `local_storage`. It does not reopen `tabs` or `active_tab`.
+//!
+//! Seal split: Windows writes `FLXP\x01` and calls `CryptProtectData`. Linux
+//! writes `FLXP\x02` and seals with AES-256-GCM from `flux-cipher`. The Linux
+//! key file `profile.key` is mode 0600 and is created before the profile bytes.
 
 use std::fs;
 use std::path::PathBuf;
@@ -26,17 +37,25 @@ pub const PROFILE_MAGIC_V2: &[u8; 5] = b"FLXP\x02";
 /// Maximum decompressed profile JSON size (8 MiB).
 pub const MAX_PROFILE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Failure from reading or writing a profile container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProfileError {
+    /// The first five bytes are not `FLXP\x01` or, on Linux, `FLXP\x02`.
     InvalidMagic,
+    /// The byte slice is shorter than a header plus tag.
     TruncatedContainer,
+    /// The Windows tag did not match, the Linux GCM tag failed, or `profile.key` was the wrong length.
     IntegrityCheckFailed,
+    /// `flux-compress` rejected the zlib payload or it exceeded `MAX_PROFILE_BYTES`.
     DecompressFailed,
+    /// JSON parse failed, or the decompressed bytes were not UTF-8.
     JsonError(String),
+    /// A directory, key file, or profile file could not be created or read.
     IoError(String),
 }
 
 impl std::fmt::Display for ProfileError {
+    /// One-line text for each `ProfileError` variant.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidMagic => write!(f, "invalid profile container header"),
@@ -51,20 +70,33 @@ impl std::fmt::Display for ProfileError {
 
 impl std::error::Error for ProfileError {}
 
+/// In-memory profile. See the module note for which fields the JSON file keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileSnapshot {
+    /// Quality, script, JIT, HTTPS-only, and search-engine settings.
     pub settings: BrowserSettings,
+    /// Page zoom from 50 to 250. Values outside that range are clamped on load.
     pub zoom_percent: u16,
+    /// Stored active index. `Session::apply_profile_snapshot` does not select this tab.
     pub active_tab: usize,
+    /// Stored tab URLs. `Session::apply_profile_snapshot` does not reopen them.
     pub tab_urls: Vec<String>,
+    /// Bookmark title and URL rows.
     pub bookmarks: Vec<Bookmark>,
+    /// History title and URL rows. The same `Bookmark` shape is used.
     pub history_log: Vec<Bookmark>,
+    /// Cookie jar from `flux-net`.
     pub cookie_jar: CookieJar,
+    /// HSTS store from `flux-net`.
     pub hsts_store: HstsStore,
+    /// Download log from `downloads`.
     pub downloads: DownloadManager,
+    /// Origin-partitioned `(origin, key, value)` rows from `window.localStorage`.
+    pub local_storage: Vec<(String, String, String)>,
 }
 
 impl Default for ProfileSnapshot {
+    /// Default settings, 100 percent zoom, no tabs, and empty jars.
     fn default() -> Self {
         Self {
             settings: BrowserSettings::default(),
@@ -76,6 +108,7 @@ impl Default for ProfileSnapshot {
             cookie_jar: CookieJar::new(),
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
+            local_storage: Vec::new(),
         }
     }
 }
@@ -171,6 +204,16 @@ pub fn snapshot_to_json(snapshot: &ProfileSnapshot) -> String {
     }
     root.insert("downloads", snapshot.downloads.to_json_value());
 
+    let mut ls_arr = JsonValue::empty_array();
+    for (origin, key, value) in &snapshot.local_storage {
+        let mut item = JsonValue::empty_object();
+        item.insert("origin", JsonValue::String(origin.clone()));
+        item.insert("key", JsonValue::String(key.clone()));
+        item.insert("value", JsonValue::String(value.clone()));
+        ls_arr.push(item);
+    }
+    root.insert("local_storage", ls_arr);
+
     to_json_pretty(&root)
 }
 
@@ -263,15 +306,36 @@ pub fn snapshot_from_json(json_src: &str) -> Result<ProfileSnapshot, ProfileErro
     if let Some(dl_arr) = doc.get("downloads").and_then(JsonValue::as_array) {
         snapshot.downloads = DownloadManager::from_json_array(dl_arr);
     }
+    if let Some(ls_arr) = doc.get("local_storage").and_then(JsonValue::as_array) {
+        for item in ls_arr {
+            let origin = item.get("origin").and_then(JsonValue::as_str).unwrap_or("");
+            let key = item.get("key").and_then(JsonValue::as_str).unwrap_or("");
+            let value = item.get("value").and_then(JsonValue::as_str).unwrap_or("");
+            if !origin.is_empty() && !key.is_empty() {
+                snapshot.local_storage.push((
+                    origin.to_string(),
+                    key.to_string(),
+                    value.to_string(),
+                ));
+            }
+        }
+    }
 
     Ok(snapshot)
 }
 
-/// Compress, OS-keystore seal (`DPAPI` on Windows), and MAC-authenticate a [`ProfileSnapshot`]
-/// into a binary `FLXP\x01` container.
+/// JSON, then zlib, then the platform seal.
+///
+/// Windows wraps a DPAPI blob in `FLXP\x01` and appends `compute_keyed_mac`.
+/// Other targets seal with AES-256-GCM under `linux_seal::session_key` and return
+/// `FLXP\x02`. A missing session key returns an empty vector. This function does
+/// not write `profile.key`.
 pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u8> {
     let json_bytes = snapshot_to_json(snapshot).into_bytes();
     let compressed = compress_zlib(&json_bytes);
+    // Not Windows: AES-256-GCM (`FLXP\x02`) with the in-memory `session_key`.
+    // That key is not `profile.key`. `save_encrypted_profile_to_path` is the path
+    // that writes the key file before the profile.
     #[cfg(not(windows))]
     {
         let Ok(key) = linux_seal::session_key() else {
@@ -279,6 +343,7 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
         };
         return linux_seal::seal(&compressed, nonce, &key).unwrap_or_default();
     }
+    // Windows: DPAPI seal, then an FNV-style tag, then the `FLXP\x01` wrapper.
     #[cfg(windows)]
     {
         let sealed = os_keystore_seal(&compressed, nonce);
@@ -292,8 +357,12 @@ pub fn encode_encrypted_profile(snapshot: &ProfileSnapshot, nonce: u64) -> Vec<u
     }
 }
 
-/// Verify, unseal (`DPAPI` on Windows), decompress, and parse either a `FLXP\x01` binary container
-/// or plain JSON bytes.
+/// Decode JSON, a Windows `FLXP\x01` blob, or a Linux `FLXP\x02` blob.
+///
+/// A leading `{` is parsed as JSON with no seal check. On non-Windows, `FLXP\x02`
+/// is opened with `linux_seal::session_key`, the in-memory key, not `profile.key`.
+/// `load_profile_from_path` uses the key file for that header instead.
+/// `FLXP\x01` checks `compute_keyed_mac`, then `os_keystore_unseal`, then zlib.
 pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileError> {
     if bytes.starts_with(b"{") {
         let text =
@@ -327,13 +396,16 @@ pub fn decode_profile_bytes(bytes: &[u8]) -> Result<ProfileSnapshot, ProfileErro
     snapshot_from_json(text)
 }
 
+/// Direct `crypt32` calls. Used only on Windows, from `os_keystore_seal` and `os_keystore_unseal`.
 #[cfg(windows)]
 mod win_dpapi {
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
 
+    /// `CryptProtectData` flag. Do not show a prompt.
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x01;
 
+    /// `DATA_BLOB` layout passed to `crypt32`.
     #[repr(C)]
     struct DataBlob {
         cb_data: u32,
@@ -342,6 +414,7 @@ mod win_dpapi {
 
     #[link(name = "crypt32")]
     unsafe extern "system" {
+        /// Seal bytes for the current user. `protect` is the caller.
         fn CryptProtectData(
             p_data_in: *const DataBlob,
             sz_data_descr: *const u16,
@@ -352,6 +425,7 @@ mod win_dpapi {
             p_data_out: *mut DataBlob,
         ) -> i32;
 
+        /// Open bytes sealed for the current user. `unprotect` is the caller.
         fn CryptUnprotectData(
             p_data_in: *const DataBlob,
             ppsz_data_descr: *mut *mut u16,
@@ -365,9 +439,11 @@ mod win_dpapi {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        /// Release the buffer `crypt32` allocated for the output blob.
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
+    /// Call `CryptProtectData`. `nonce` is the optional entropy. Empty input returns an empty vector.
     pub fn protect(plain: &[u8], nonce: u64) -> Option<Vec<u8>> {
         if plain.is_empty() {
             return Some(Vec::new());
@@ -406,6 +482,7 @@ mod win_dpapi {
         }
     }
 
+    /// Call `CryptUnprotectData` with the same nonce entropy. Empty input returns an empty vector.
     pub fn unprotect(cipher: &[u8], nonce: u64) -> Option<Vec<u8>> {
         if cipher.is_empty() {
             return Some(Vec::new());
@@ -445,6 +522,7 @@ mod win_dpapi {
     }
 }
 
+/// Windows: DPAPI-seal `compressed`. If `CryptProtectData` fails, return the zlib bytes unchanged.
 #[cfg(windows)]
 fn os_keystore_seal(compressed: &[u8], nonce: u64) -> Vec<u8> {
     #[cfg(windows)]
@@ -458,6 +536,9 @@ fn os_keystore_seal(compressed: &[u8], nonce: u64) -> Vec<u8> {
     compressed.to_vec()
 }
 
+/// Windows: DPAPI-open `sealed`. If that fails, return `sealed` unchanged.
+///
+/// On non-Windows this returns `sealed` unchanged. Linux file profiles do not call it.
 fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError> {
     #[cfg(windows)]
     {
@@ -469,7 +550,13 @@ fn os_keystore_unseal(sealed: &[u8], nonce: u64) -> Result<Vec<u8>, ProfileError
     Ok(sealed.to_vec())
 }
 
-/// Save a profile container to `path` (creating parent directories if needed).
+/// Write `path`, creating parent directories first.
+///
+/// The nonce is `bookmarks.len * 31 + history.len`. It is not random.
+/// On Linux, `load_or_create_key` runs before the profile write. That creates
+/// `profile.key` with mode 0600 and calls `sync_all` on the new key file when
+/// the key does not already exist. The profile bytes are written after that.
+/// On Windows, `encode_encrypted_profile` applies DPAPI and the file is `FLXP\x01`.
 pub fn save_encrypted_profile_to_path(
     snapshot: &ProfileSnapshot,
     path: &std::path::Path,
@@ -482,6 +569,7 @@ pub fn save_encrypted_profile_to_path(
     let nonce = (snapshot.bookmarks.len() as u64)
         .wrapping_mul(31)
         .wrapping_add(snapshot.history_log.len() as u64);
+    // Linux seal order: key file (0600) first, then zlib, then AES-256-GCM, then the profile.
     #[cfg(not(windows))]
     {
         let key = linux_seal::load_or_create_key(path)?;
@@ -491,6 +579,7 @@ pub fn save_encrypted_profile_to_path(
         fs::write(path, bytes).map_err(|e| ProfileError::IoError(e.to_string()))?;
         return Ok(());
     }
+    // Windows seal: DPAPI inside `encode_encrypted_profile`, then write `FLXP\x01`.
     #[cfg(windows)]
     {
         let bytes = encode_encrypted_profile(snapshot, nonce);
@@ -514,6 +603,7 @@ pub fn load_profile_from_path(path: &std::path::Path) -> Result<ProfileSnapshot,
     decode_profile_bytes(&bytes)
 }
 
+/// AES-256-GCM profile seal. Not compiled on Windows. `flux-cipher` performs the seal.
 #[cfg(not(windows))]
 mod linux_seal {
     use super::ProfileError;
@@ -523,8 +613,10 @@ mod linux_seal {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    /// Process-lifetime key for `encode_encrypted_profile`. Not written to disk.
     static SESSION_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 
+    /// Return the in-memory key, creating it from `/dev/urandom` on first use.
     pub fn session_key() -> Result<[u8; 32], ProfileError> {
         let mut slot = SESSION_KEY
             .lock()
@@ -537,6 +629,9 @@ mod linux_seal {
         Ok(key)
     }
 
+    /// Read 32 bytes from `profile.key` next to `profile_path`. Wrong length is an integrity error.
+    ///
+    /// Also tries to set the existing file to mode 0600.
     pub fn read_key_file(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
         let path = key_file(profile_path);
         let bytes = fs::read(&path).map_err(|e| ProfileError::IoError(e.to_string()))?;
@@ -549,6 +644,9 @@ mod linux_seal {
         Ok(key)
     }
 
+    /// Read `profile.key`, or create it with `write_new_key` before any profile bytes are written.
+    ///
+    /// If create races and the file appears, the existing file is read instead.
     pub fn load_or_create_key(profile_path: &Path) -> Result<[u8; 32], ProfileError> {
         let path = key_file(profile_path);
         if path.exists() {
@@ -561,6 +659,7 @@ mod linux_seal {
         }
     }
 
+    /// Create `path` with `create_new` and mode 0600, write 32 random bytes, then `sync_all`.
     fn write_new_key(path: &Path) -> Result<[u8; 32], ProfileError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -581,10 +680,12 @@ mod linux_seal {
         Ok(key)
     }
 
+    /// `profile.key` in the same directory as the profile, replacing the file name.
     fn key_file(profile_path: &Path) -> PathBuf {
         profile_path.with_file_name("profile.key")
     }
 
+    /// Read 32 bytes from `/dev/urandom`.
     fn random_bytes() -> Result<[u8; 32], ProfileError> {
         let mut buf = [0u8; 32];
         let mut file =
@@ -594,6 +695,9 @@ mod linux_seal {
         Ok(buf)
     }
 
+    /// Build `FLXP\x02`: magic, nonce as associated data, 12-byte IV, ciphertext, 16-byte tag.
+    ///
+    /// The IV is read from `/dev/urandom`. `aes256_gcm_seal` is `flux-cipher`.
     pub fn seal(compressed: &[u8], nonce: u64, key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
         let mut iv = [0u8; 12];
         let mut file =
@@ -611,6 +715,7 @@ mod linux_seal {
         Ok(out)
     }
 
+    /// Check `FLXP\x02` and open the AES-256-GCM payload. A bad tag is `IntegrityCheckFailed`.
     pub fn open(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, ProfileError> {
         if bytes.len() < 5 + 8 + 12 + 16 {
             return Err(ProfileError::TruncatedContainer);
@@ -630,6 +735,7 @@ mod linux_seal {
     }
 }
 
+/// Open a `FLXP\x02` blob with `key`, zlib-decompress, and parse the JSON snapshot.
 #[cfg(not(windows))]
 fn decode_linux_profile(bytes: &[u8], key: &[u8; 32]) -> Result<ProfileSnapshot, ProfileError> {
     let compressed = linux_seal::open(bytes, key)?;
@@ -640,6 +746,7 @@ fn decode_linux_profile(bytes: &[u8], key: &[u8; 32]) -> Result<ProfileSnapshot,
     snapshot_from_json(text)
 }
 
+/// 64-bit FNV-style tag over `nonce` and `payload`. Used on the Windows container, not AES-GCM.
 fn compute_keyed_mac(nonce: u64, payload: &[u8]) -> u64 {
     let mut acc = 14695981039346656037u64 ^ nonce;
     for &b in payload {
@@ -651,9 +758,11 @@ fn compute_keyed_mac(nonce: u64, payload: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    //! Round-trip one snapshot through `encode_encrypted_profile`. On Linux, also check two key files differ.
     use super::*;
 
     #[test]
+    /// Seal one snapshot and open it. Flipping a ciphertext byte fails the integrity check.
     fn encrypts_authenticates_and_restores_full_profile_snapshot() {
         let mut jar = CookieJar::new();
         assert!(jar.store_set_cookie(
@@ -687,6 +796,11 @@ mod tests {
             cookie_jar: jar,
             hsts_store: hsts,
             downloads: DownloadManager::new(),
+            local_storage: vec![(
+                "https://example.com".to_string(),
+                "theme".to_string(),
+                "obsidian".to_string(),
+            )],
         };
 
         let mut encrypted = encode_encrypted_profile(&snap, 0x1234_5678_9ABC_DEF0);
@@ -708,6 +822,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    /// Two directories get different 32-byte `profile.key` files, and each profile still loads.
     fn separate_directories_do_not_share_profile_keys() {
         let dir = std::env::temp_dir().join(format!("flux-profile-{}-{}", std::process::id(), 16));
         let _ = fs::remove_dir_all(&dir);
@@ -725,6 +840,7 @@ mod tests {
             cookie_jar: CookieJar::new(),
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
+            local_storage: Vec::new(),
         };
         let path_one = one.join("profile.flx");
         let path_two = two.join("profile.flx");

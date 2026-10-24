@@ -1,4 +1,18 @@
-//! Tabs, history, pages, and the page loader.
+//! Browser session: tabs, history, bookmarks, and page loading.
+//!
+//! `src/main.rs` calls `load_target` for the `render` and `raster` commands.
+//! `shell` calls `Session` for the window. `ui` reads session state when it
+//! builds the shell page.
+//!
+//! A tab is a `Page` history stack in this process. `flux-sandbox`'s
+//! `execute_isolated` runs a closure here and catches a panic. It does not
+//! start `--tab-worker`. That flag is handled only by `main`.
+//!
+//! Building a page uses `flux-dom` (parse), `flux-script` (scripts),
+//! `flux-style` (CSS), `flux-layout`, and `flux-paint`. `Session::rasterize`
+//! calls `flux-raster` after that. `flux-net` fetches pages, stores cookies,
+//! and checks CSP. `flux-image` decodes images. `flux-video` decodes clips.
+//! `frontend` builds `flux://` HTML. `profile` reads and writes `profile.flx`.
 
 pub mod downloads;
 pub mod frontend;
@@ -10,7 +24,7 @@ pub mod shell;
 pub mod ui;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.16";
+pub const VERSION: &str = "v.17";
 
 use std::collections::HashMap;
 use std::fs;
@@ -43,6 +57,7 @@ pub use flux_video::{
 use flux_video::{GpuVideoSession, generate_demo_mp4};
 pub use profile::{ProfileError, ProfileSnapshot, default_profile_path};
 
+/// Opaque white framebuffer used when the active tab has no page.
 const PAPER: Color = Color {
     r: 255,
     g: 255,
@@ -50,26 +65,35 @@ const PAPER: Color = Color {
     a: 255,
 };
 
+/// Width and height in CSS pixels. `main` fills this from `--width` and `--height`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
+    /// Viewport width in CSS pixels.
     pub width: f32,
+    /// Viewport height in CSS pixels.
     pub height: f32,
 }
 
+/// A title and URL. History rows use this same shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bookmark {
     pub title: String,
     pub url: String,
 }
 
+/// Search engine chosen on the settings page and stored in the profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchEngine {
+    /// Google Search. Slug `google`. Home URL `https://www.google.com`.
     Google,
+    /// DuckDuckGo. Slug `duckduckgo`. Home URL `https://duckduckgo.com`.
     DuckDuckGo,
+    /// Microsoft Bing. Slug `bing`. Home URL `https://www.bing.com`.
     Bing,
 }
 
 impl SearchEngine {
+    /// Settings label: Google Search, DuckDuckGo, or Microsoft Bing.
     pub fn label(self) -> &'static str {
         match self {
             Self::Google => "Google Search",
@@ -78,6 +102,7 @@ impl SearchEngine {
         }
     }
 
+    /// Short label used where the full engine name does not fit.
     pub fn short_badge(self) -> &'static str {
         match self {
             Self::Google => "Google",
@@ -86,6 +111,7 @@ impl SearchEngine {
         }
     }
 
+    /// Stable profile value: `google`, `duckduckgo`, or `bing`.
     pub fn slug(self) -> &'static str {
         match self {
             Self::Google => "google",
@@ -94,6 +120,7 @@ impl SearchEngine {
         }
     }
 
+    /// Engine home page used when a navigation query is empty.
     pub fn home_url(self) -> &'static str {
         match self {
             Self::Google => "https://www.google.com",
@@ -102,6 +129,7 @@ impl SearchEngine {
         }
     }
 
+    /// Query URL for this engine. `query` is form-encoded.
     pub fn search_url(self, query: &str) -> String {
         let encoded = frontend::urlencode_component(query.trim());
         match self {
@@ -111,6 +139,7 @@ impl SearchEngine {
         }
     }
 
+    /// Google Search, then DuckDuckGo, then Microsoft Bing, then Google Search.
     pub fn cycle_next(self) -> Self {
         match self {
             Self::Google => Self::DuckDuckGo,
@@ -119,6 +148,7 @@ impl SearchEngine {
         }
     }
 
+    /// Parse a profile slug. Unknown text becomes Google Search.
     pub fn from_slug(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "duckduckgo" | "ddg" => Self::DuckDuckGo,
@@ -128,16 +158,23 @@ impl SearchEngine {
     }
 }
 
+/// Toggles stored in the profile and edited from `flux://settings`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BrowserSettings {
+    /// Passed to `GpuVideoSession::set_hardware_acceleration`. The settings page still says frames are decoded on the CPU.
     pub gpu_video_acceleration: bool,
+    /// When set, `open_target` rewrites an `http://` URL to `https://`.
     pub https_only_mode: bool,
+    /// Stored in the profile and shown on the settings page. The page loader in this file does not read it.
     pub scripts_enabled: bool,
+    /// Copied onto the settings page runtime with `ScriptRuntime::set_jit_enabled`.
     pub jit_enabled: bool,
+    /// Engine used by `open_target` for `flux://navigate` and the start page.
     pub search_engine: SearchEngine,
 }
 
 impl Default for BrowserSettings {
+    /// GPU video flag on, HTTPS-only off, scripts on, JIT on, Google Search.
     fn default() -> Self {
         Self {
             gpu_video_acceleration: true,
@@ -149,16 +186,26 @@ impl Default for BrowserSettings {
     }
 }
 
+/// What `Session::click_at` did with one pointer hit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClickOutcome {
+    /// The click did not change the page.
     None,
+    /// A document script handled the click and the page was restaged.
     ScriptHandled,
+    /// A text field took focus.
     InputFocused(NodeId),
+    /// A checkbox was toggled. The bool is the new checked state.
     CheckboxToggled(NodeId, bool),
+    /// A select control cycled to this option value.
     SelectChanged(NodeId, String),
+    /// Play or pause flipped. The bool is the new playing flag.
     VideoToggled(NodeId, bool),
+    /// The video timeline moved to this time in milliseconds.
     VideoSeeked(NodeId, u32),
+    /// The caller should open this URL.
     Navigate(String),
+    /// The caller should POST `body` to `url`.
     SubmitPost { url: String, body: String },
 }
 
@@ -172,6 +219,7 @@ pub struct VideoPlayerState {
 }
 
 impl VideoPlayerState {
+    /// Paused player at time zero. Duration is at least 33 ms.
     pub fn new(clip: VideoClip) -> Self {
         let duration_ms = clip.duration_ms().max(33);
         Self {
@@ -182,15 +230,18 @@ impl VideoPlayerState {
         }
     }
 
+    /// Clamp `target_ms` to `duration_ms`.
     pub fn seek_to_ms(&mut self, target_ms: u32) {
         self.current_ms = target_ms.min(self.duration_ms);
     }
 
+    /// Advance time and wrap with modulo `duration_ms + 1`.
     pub fn step_by_ms(&mut self, delta_ms: u32) {
         let span = self.duration_ms.max(1);
         self.current_ms = (self.current_ms + delta_ms) % (span + 1);
     }
 
+    /// Frame at `current_ms`, or the poster, with the control bar drawn on top.
     pub fn render_surface(&self) -> Option<Image> {
         let frame = self
             .clip
@@ -202,6 +253,7 @@ impl VideoPlayerState {
     }
 }
 
+/// Draw the bottom bar, play or pause mark, and timeline. Images under 48 by 32 are unchanged.
 fn overlay_video_controls_hud(img: &mut Image, playing: bool, current_ms: u32, duration_ms: u32) {
     if img.width < 48 || img.height < 32 {
         return;
@@ -282,6 +334,10 @@ fn overlay_video_controls_hud(img: &mut Image, playing: bool, current_ms: u32, d
     }
 }
 
+/// One loaded document after parse, style, layout, and paint.
+///
+/// `rasterize` is not stored here. `Session::rasterize` builds the framebuffer
+/// from `display_list`. `runtime` is the `flux-script` host for this page.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Page {
     pub url: String,
@@ -301,16 +357,19 @@ pub struct Page {
 }
 
 impl Page {
+    /// Bottom of the root layout box. Negative sums become 0.
     pub fn content_height(&self) -> f32 {
         (self.layout.rect.y + self.layout.rect.height).max(0.0)
     }
 
+    /// `flux-layout` hit test in page coordinates, before scroll and zoom.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<NodeId> {
         hit_test(&self.layout, x, y)
     }
 
     /// Find the laid-out bounding rectangle of `target` in page coordinates.
     pub fn find_layout_rect(&self, target: NodeId) -> Option<Rect> {
+        /// Depth-first search for the layout rect of `target`.
         fn walk_rect(b: &LayoutBox, target: NodeId) -> Option<Rect> {
             if b.node == target {
                 return Some(b.rect);
@@ -369,6 +428,7 @@ impl Page {
         }
     }
 
+    /// Walk from the hit node through its parents to the first text input.
     pub fn text_input_at(&self, x: f32, y: f32) -> Option<NodeId> {
         let mut cursor = self.hit_test(x, y);
         while let Some(id) = cursor {
@@ -380,6 +440,7 @@ impl Page {
         None
     }
 
+    /// Walk from the hit node through its parents to the first non-empty anchor `href`.
     pub fn link_at(&self, x: f32, y: f32) -> Option<&str> {
         let mut cursor = self.hit_test(x, y);
         while let Some(id) = cursor {
@@ -396,6 +457,7 @@ impl Page {
         None
     }
 
+    /// Parse CSS, lay out, and paint again. Does not re-run scripts or re-fetch resources.
     pub fn restage(&mut self, viewport: Viewport) {
         let embedded = self.document.embedded_css();
         let combined_css = match (self.external_css.is_empty(), embedded.is_empty()) {
@@ -417,14 +479,19 @@ impl Page {
     }
 }
 
+/// Failure from `load_url` before a `Page` exists.
 #[derive(Debug)]
 pub enum BrowserError {
+    /// `flux-net` could not complete the fetch.
     Net(NetError),
+    /// HTTP status outside 200..299.
     Status(u16),
+    /// The response body was not UTF-8 text.
     Utf8,
 }
 
 impl std::fmt::Display for BrowserError {
+    /// One-line text for a network error, an HTTP status, or a non-text body.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Net(err) => write!(f, "{err}"),
@@ -436,14 +503,17 @@ impl std::fmt::Display for BrowserError {
 
 impl std::error::Error for BrowserError {}
 
+/// Render `html` with an empty stylesheet and an empty image map.
 pub fn render_html(html: &str, url: &str, viewport: Viewport) -> Page {
     render_html_with_css(html, "", url, viewport)
 }
 
+/// Render `html` with `external_css` and an empty image map.
 pub fn render_html_with_css(html: &str, external_css: &str, url: &str, viewport: Viewport) -> Page {
     render_html_with_resources(html, external_css, HashMap::new(), url, viewport)
 }
 
+/// Render `html` with `external_css` and `images`, and no CSP header.
 pub fn render_html_with_resources(
     html: &str,
     external_css: &str,
@@ -454,7 +524,52 @@ pub fn render_html_with_resources(
     render_html_with_resources_and_csp(html, external_css, images, url, viewport, None, 0)
 }
 
+/// Build a `Page` from HTML with pre-populated `local_storage`.
+pub fn render_html_with_storage(
+    html: &str,
+    url: &str,
+    viewport: Viewport,
+    initial_storage: &[(String, String, String)],
+) -> Page {
+    render_html_with_resources_csp_and_storage(
+        html,
+        "",
+        HashMap::new(),
+        url,
+        viewport,
+        None,
+        0,
+        initial_storage,
+    )
+}
+
+/// Build a `Page` from HTML.
+///
+/// The steps are marked at the parse call. Raster is not one of them.
 pub fn render_html_with_resources_and_csp(
+    html: &str,
+    external_css: &str,
+    images: HashMap<NodeId, Image>,
+    url: &str,
+    viewport: Viewport,
+    http_csp_header: Option<&str>,
+    initial_blocked_csp: usize,
+) -> Page {
+    render_html_with_resources_csp_and_storage(
+        html,
+        external_css,
+        images,
+        url,
+        viewport,
+        http_csp_header,
+        initial_blocked_csp,
+        &[],
+    )
+}
+
+/// Build a `Page` from HTML with optional pre-populated `localStorage` entries.
+#[allow(clippy::too_many_arguments)]
+pub fn render_html_with_resources_csp_and_storage(
     html: &str,
     external_css: &str,
     mut images: HashMap<NodeId, Image>,
@@ -462,7 +577,12 @@ pub fn render_html_with_resources_and_csp(
     viewport: Viewport,
     http_csp_header: Option<&str>,
     initial_blocked_csp: usize,
+    initial_storage: &[(String, String, String)],
 ) -> Page {
+    // Pipeline order: parse HTML (flux-dom), run allowed scripts (flux-script),
+    // attach images and video frames, parse CSS and compute style (flux-style),
+    // lay out (flux-layout), then paint (flux-paint). Session::rasterize calls
+    // flux-raster later. This function does not rasterize and does not start a worker.
     let mut document = flux_dom::parse_html(html);
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
@@ -475,6 +595,9 @@ pub fn render_html_with_resources_and_csp(
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
+    if !initial_storage.is_empty() {
+        runtime.import_local_storage(initial_storage);
+    }
     for (src, integrity) in document.external_scripts_with_integrity() {
         if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
             blocked_csp_count += 1;
@@ -599,6 +722,7 @@ pub fn render_html_with_resources_and_csp(
     }
 }
 
+/// GET `url` with `flux-net`, fetch allowed stylesheets and images, then render.
 pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     let (final_url, response) = fetch(url).map_err(BrowserError::Net)?;
     if !(200..300).contains(&response.status) {
@@ -635,6 +759,7 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
     ))
 }
 
+/// POST `body` when `url` is http(s). Any other URL calls `load_target` and ignores `body`.
 pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let (final_url, response) =
@@ -678,6 +803,10 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
     }
 }
 
+/// Load a built-in page, an http(s) URL, or a local HTML file.
+///
+/// `flux://navigate` is resolved with Google Search, not the session engine.
+/// `Session::open_target` handles that prefix itself before it calls this function.
 pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
     if let Some(dest) = frontend::resolve_navigation_query(target) {
         return load_target(&dest, viewport);
@@ -712,11 +841,13 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
     }
 }
 
+/// True when `url` starts with `http://` or `https://` after trimming.
 fn is_remote_origin(url: &str) -> bool {
     let trimmed = url.trim();
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
 }
 
+/// Decode page images. Built-in `flux://logo.png` and `flux://engine-*.png` are drawn here. CSP or the shield can skip a URL.
 fn fetch_page_images(
     base: &str,
     imgs: &[(NodeId, String)],
@@ -790,6 +921,10 @@ fn fetch_page_images(
     out
 }
 
+/// Decode `<video>` sources with `GpuVideoSession`.
+///
+/// `flux://demo.mp4` and `flux://encrypted.mp4` are generated in this process.
+/// A file whose `ftyp` box fails `inspect_mp4_metadata` is skipped.
 fn fetch_page_videos(
     base: &str,
     vids: &[(NodeId, String)],
@@ -856,6 +991,7 @@ fn fetch_page_videos(
     out
 }
 
+/// Fetch linked stylesheets that CSP, the shield, and the integrity check allow, then join them.
 fn fetch_linked_stylesheets(
     base: &str,
     links: &[(String, Option<String>)],
@@ -915,6 +1051,7 @@ fn fetch_linked_stylesheets(
     sheets.join("\n")
 }
 
+/// History stack for one tab, plus the index of the visible page. Not a separate process.
 #[derive(Debug)]
 pub struct Tab {
     history: Vec<Page>,
@@ -922,6 +1059,7 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// A tab with no pages. `current` is `None` and the title is `New Tab`.
     fn empty() -> Self {
         Self {
             history: Vec::new(),
@@ -929,22 +1067,27 @@ impl Tab {
         }
     }
 
+    /// Page at `index`, if the stack has one.
     pub fn current(&self) -> Option<&Page> {
         self.history.get(self.index)
     }
 
+    /// Mutable page at `index`, if the stack has one.
     pub fn current_mut(&mut self) -> Option<&mut Page> {
         self.history.get_mut(self.index)
     }
 
+    /// True when the stack is non-empty and `index` is not zero.
     pub fn can_go_back(&self) -> bool {
         !self.history.is_empty() && self.index > 0
     }
 
+    /// True when a page exists after `index`.
     pub fn can_go_forward(&self) -> bool {
         self.index + 1 < self.history.len()
     }
 
+    /// Current title, else the current URL, else `New Tab`.
     pub fn title(&self) -> &str {
         let Some(page) = self.current() else {
             return "New Tab";
@@ -958,12 +1101,14 @@ impl Tab {
         }
     }
 
+    /// Overwrite the current history entry. No-op when the stack is empty.
     fn replace_current(&mut self, page: Page) {
         if let Some(slot) = self.history.get_mut(self.index) {
             *slot = page;
         }
     }
 
+    /// Drop entries after `index`, push `page`, and select it.
     fn navigate(&mut self, page: Page) {
         if !self.history.is_empty() {
             self.history.truncate(self.index + 1);
@@ -972,6 +1117,7 @@ impl Tab {
         self.index = self.history.len() - 1;
     }
 
+    /// Select the previous page. Returns false at the start of the stack.
     fn back(&mut self) -> bool {
         if !self.can_go_back() {
             return false;
@@ -980,6 +1126,7 @@ impl Tab {
         true
     }
 
+    /// Select the next page. Returns false at the end of the stack.
     fn forward(&mut self) -> bool {
         if !self.can_go_forward() {
             return false;
@@ -989,6 +1136,11 @@ impl Tab {
     }
 }
 
+/// Window session. Tabs, scroll, and the clipboard live in this process.
+///
+/// `gpu_video` decodes clip bytes. It does not present a window.
+/// `sandbox_guard` holds the process limits from `flux-sandbox`.
+/// `cookie_jar`, `network_shield`, and `hsts_store` come from `flux-net`.
 #[derive(Debug)]
 pub struct Session {
     tabs: Vec<Tab>,
@@ -1005,11 +1157,13 @@ pub struct Session {
     network_shield: NetworkShield,
     hsts_store: HstsStore,
     downloads: DownloadManager,
+    local_storage: Vec<(String, String, String)>,
     clipboard: String,
     selected_text: String,
 }
 
 impl Session {
+    /// One empty tab at 100 percent zoom. Exits the process if the sandbox guard cannot be installed.
     pub fn new(viewport: Viewport) -> Self {
         let sandbox_guard = enforce_mandatory_sandbox_or_abort();
         Self {
@@ -1027,100 +1181,148 @@ impl Session {
             network_shield: NetworkShield::new(),
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
+            local_storage: Vec::new(),
             clipboard: String::new(),
             selected_text: String::new(),
         }
     }
 
+    /// Borrow the origin-partitioned `(origin, key, value)` entries in `localStorage`.
+    pub fn local_storage_entries(&self) -> &[(String, String, String)] {
+        &self.local_storage
+    }
+
+    /// Merge `(origin, key, value)` rows from `rows` into `self.local_storage`.
+    fn merge_local_storage(&mut self, rows: Vec<(String, String, String)>) {
+        for (origin, key, value) in rows {
+            if origin.is_empty() || key.is_empty() {
+                continue;
+            }
+            if let Some(existing) = self
+                .local_storage
+                .iter_mut()
+                .find(|(o, k, _)| o == &origin && k == &key)
+            {
+                existing.2 = value;
+            } else {
+                self.local_storage.push((origin, key, value));
+            }
+        }
+        self.local_storage
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    }
+
+    /// Limits and fault counts reported by `sandbox_guard`.
     pub fn sandbox_telemetry(&self) -> SandboxTelemetry {
         self.sandbox_guard.telemetry()
     }
 
+    /// Borrow the cookie jar.
     pub fn cookie_jar(&self) -> &CookieJar {
         &self.cookie_jar
     }
 
+    /// Mutable cookie jar.
     pub fn cookie_jar_mut(&mut self) -> &mut CookieJar {
         &mut self.cookie_jar
     }
 
+    /// Borrow the network shield.
     pub fn network_shield(&self) -> &NetworkShield {
         &self.network_shield
     }
 
+    /// Mutable network shield.
     pub fn network_shield_mut(&mut self) -> &mut NetworkShield {
         &mut self.network_shield
     }
 
+    /// Borrow the HSTS store.
     pub fn hsts_store(&self) -> &HstsStore {
         &self.hsts_store
     }
 
+    /// Mutable HSTS store.
     pub fn hsts_store_mut(&mut self) -> &mut HstsStore {
         &mut self.hsts_store
     }
 
+    /// Borrow the download log.
     pub fn downloads(&self) -> &DownloadManager {
         &self.downloads
     }
 
+    /// Mutable download log.
     pub fn downloads_mut(&mut self) -> &mut DownloadManager {
         &mut self.downloads
     }
 
+    /// Zoom percent, kept between 50 and 250.
     pub fn zoom_percent(&self) -> u16 {
         self.zoom_percent
     }
 
+    /// Engine stored in `settings`.
     pub fn search_engine(&self) -> SearchEngine {
         self.settings.search_engine
     }
 
+    /// Store `engine`. Does not reload the active page.
     pub fn set_search_engine(&mut self, engine: SearchEngine) {
         self.settings.search_engine = engine;
     }
 
+    /// Advance the stored engine and return it.
     pub fn cycle_search_engine(&mut self) -> SearchEngine {
         self.settings.search_engine = self.settings.search_engine.cycle_next();
         self.settings.search_engine
     }
 
+    /// `zoom_percent / 100`, clamped to the range 0.5 through 2.5.
     pub fn zoom_factor(&self) -> f32 {
         (self.zoom_percent as f32 / 100.0).clamp(0.5, 2.5)
     }
 
+    /// Clamp `percent` to 50 through 250 and clamp scroll to the new maximum.
     pub fn set_zoom_percent(&mut self, percent: u16) -> u16 {
         self.zoom_percent = percent.clamp(50, 250);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         self.zoom_percent
     }
 
+    /// Add 25 percent, capped at 250.
     pub fn zoom_in(&mut self) -> u16 {
         let next = self.zoom_percent.saturating_add(25).min(250);
         self.set_zoom_percent(next)
     }
 
+    /// Subtract 25 percent, floored at 50.
     pub fn zoom_out(&mut self) -> u16 {
         let next = self.zoom_percent.saturating_sub(25).max(50);
         self.set_zoom_percent(next)
     }
 
+    /// Set zoom to 100.
     pub fn reset_zoom(&mut self) -> u16 {
         self.set_zoom_percent(100)
     }
 
+    /// Last text copied inside this session. This is not the operating-system clipboard.
     pub fn clipboard_text(&self) -> &str {
         &self.clipboard
     }
 
+    /// Replace the session clipboard string.
     pub fn set_clipboard_text(&mut self, text: &str) {
         self.clipboard = text.to_string();
     }
 
+    /// Last text stored by `select_text_at`.
     pub fn selected_text(&self) -> &str {
         &self.selected_text
     }
 
+    /// Hit-test page text at the zoomed, scrolled point and store it.
     pub fn select_text_at(&mut self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
@@ -1129,6 +1331,7 @@ impl Session {
         Some(found)
     }
 
+    /// Copy the focused input, else the selection, else the page URL, into the session clipboard.
     pub fn copy_selection_or_focused(&mut self) -> Option<String> {
         let value = if let Some(page) = self.active().current() {
             if let Some(id) = page.focused_input {
@@ -1148,6 +1351,7 @@ impl Session {
         Some(value)
     }
 
+    /// Copy the focused input and clear it. Returns `None` when nothing is focused.
     pub fn cut_focused_input(&mut self) -> Option<String> {
         let viewport = self.viewport;
         let page = self.tabs[self.active].current_mut()?;
@@ -1159,6 +1363,7 @@ impl Session {
         Some(val)
     }
 
+    /// Append printable ASCII from `text` to the focused input.
     pub fn paste_into_focused_input(&mut self, text: &str) -> bool {
         let clean: String = text.chars().filter(|c| (' '..='~').contains(c)).collect();
         if clean.is_empty() {
@@ -1177,30 +1382,37 @@ impl Session {
         false
     }
 
+    /// Copy of the settings struct.
     pub fn settings(&self) -> BrowserSettings {
         self.settings
     }
 
+    /// `flux-video` session used to decode clips. Not a window presenter.
     pub fn gpu_video(&self) -> &GpuVideoSession {
         &self.gpu_video
     }
 
+    /// History rows recorded by `open_page`.
     pub fn history_log(&self) -> &[Bookmark] {
         &self.history_log
     }
 
+    /// Remove history rows. Bookmarks are left in place.
     pub fn clear_history_log(&mut self) {
         self.history_log.clear();
     }
 
+    /// Current viewport size.
     pub fn viewport(&self) -> Viewport {
         self.viewport
     }
 
+    /// Vertical scroll in pixels.
     pub fn scroll(&self) -> f32 {
         self.scroll
     }
 
+    /// Content height times zoom, minus the viewport height, floored at 0.
     pub fn max_scroll(&self) -> f32 {
         let Some(page) = self.active().current() else {
             return 0.0;
@@ -1208,17 +1420,20 @@ impl Session {
         (page.content_height() * self.zoom_factor() - self.viewport.height).max(0.0)
     }
 
+    /// Add `delta` to scroll and clamp it.
     pub fn scroll_by(&mut self, delta: f32) -> f32 {
         self.scroll = (self.scroll + delta).clamp(0.0, self.max_scroll());
         self.scroll
     }
 
+    /// Set scroll to `ratio` times `max_scroll`. `ratio` is clamped to 0 through 1.
     pub fn scroll_to_ratio(&mut self, ratio: f32) -> f32 {
         let max_s = self.max_scroll();
         self.scroll = (ratio.clamp(0.0, 1.0) * max_s).clamp(0.0, max_s);
         self.scroll
     }
 
+    /// Store the size, restage the active page, and clamp scroll.
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.viewport = viewport;
         if let Some(current) = self.tabs[self.active].current_mut() {
@@ -1227,6 +1442,7 @@ impl Session {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
     }
 
+    /// Resolve the anchor under the zoomed point against the page URL.
     pub fn hit_link(&self, x: f32, y: f32) -> Option<String> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
@@ -1234,18 +1450,21 @@ impl Session {
         resolve_url(&page.url, href)
     }
 
+    /// Text input under the zoomed, scrolled point.
     pub fn hit_text_input(&self, x: f32, y: f32) -> Option<NodeId> {
         let z = self.zoom_factor();
         let page = self.active().current()?;
         page.text_input_at(x / z, (y + self.scroll) / z)
     }
 
+    /// True when the active page has a focused text input.
     pub fn has_focused_input(&self) -> bool {
         self.active()
             .current()
             .is_some_and(|p| p.focused_input.is_some())
     }
 
+    /// Clear input focus and restage. Returns whether focus was set.
     pub fn blur_page_input(&mut self) -> bool {
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut() {
@@ -1257,6 +1476,7 @@ impl Session {
         false
     }
 
+    /// Append one printable ASCII character to the focused input and restage.
     pub fn type_into_focused_input(&mut self, ch: char) -> bool {
         if !(' '..='~').contains(&ch) {
             return false;
@@ -1274,6 +1494,7 @@ impl Session {
         false
     }
 
+    /// Drop the last character of the focused input and restage.
     pub fn backspace_focused_input(&mut self) -> bool {
         let viewport = self.viewport;
         if let Some(page) = self.tabs[self.active].current_mut() {
@@ -1288,6 +1509,7 @@ impl Session {
         false
     }
 
+    /// Blur the focused control, then submit the form that encloses it.
     pub fn submit_focused_input(&mut self) -> ClickOutcome {
         let focused = self
             .tabs
@@ -1301,6 +1523,7 @@ impl Session {
         self.submit_form_for(id)
     }
 
+    /// GET query or POST body for the form around `control_id`. Does not navigate by itself.
     pub fn submit_form_for(&mut self, control_id: NodeId) -> ClickOutcome {
         let Some(page) = self.tabs[self.active].current() else {
             return ClickOutcome::None;
@@ -1323,92 +1546,109 @@ impl Session {
             ClickOutcome::Navigate(append_query(&target_base, &encoded))
         }
     }
-
+    /// Hit-test the active page in zoomed, scrolled coordinates.
+    ///
+    /// Order: script click, video controls, text input, checkbox, select, submit,
+    /// then a link. A miss clears input focus.
     pub fn click_at(&mut self, x: f32, y: f32) -> ClickOutcome {
         let z = self.zoom_factor();
         let page_x = x / z;
         let page_y = (y + self.scroll) / z;
         let viewport = self.viewport;
         let mut submit_control = None;
+        let mut harvested_storage = None;
+        let mut script_outcome = None;
         if let Some(page) = self.tabs[self.active].current_mut() {
             if let Some(node_id) = page.hit_test(page_x, page_y) {
                 if page.runtime.dispatch_click(&mut page.document, node_id) {
+                    harvested_storage = Some(page.runtime.export_local_storage());
                     if let Some(dest) = page.runtime.take_pending_navigation() {
-                        return ClickOutcome::Navigate(dest);
+                        script_outcome = Some(ClickOutcome::Navigate(dest));
+                    } else {
+                        page.restage(viewport);
+                        script_outcome = Some(ClickOutcome::ScriptHandled);
                     }
-                    page.restage(viewport);
-                    self.scroll = self.scroll.clamp(0.0, self.max_scroll());
-                    return ClickOutcome::ScriptHandled;
-                }
-                let mut cursor = Some(node_id);
-                while let Some(curr) = cursor {
-                    if page.videos.contains_key(&curr) {
-                        page.focused_input = None;
-                        let vrect = page.find_layout_rect(curr).unwrap_or(Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            width: 240.0,
-                            height: 120.0,
-                        });
-                        let rel_x = (page_x - vrect.x).max(0.0);
-                        let rel_y = (page_y - vrect.y).max(0.0);
-                        let in_scrubber = rel_y >= (vrect.height - 26.0).max(0.0) && rel_x >= 32.0;
-                        if let Some(player) = page.videos.get_mut(&curr) {
-                            if in_scrubber {
-                                let track_w = (vrect.width - 42.0).max(1.0);
-                                let ratio = ((rel_x - 32.0) / track_w).clamp(0.0, 1.0);
-                                let target_ms = ((player.duration_ms as f32 * ratio).round()
-                                    as u32)
-                                    .min(player.duration_ms);
-                                player.seek_to_ms(target_ms);
-                                if let Some(surface) = player.render_surface() {
-                                    page.images.insert(curr, surface);
+                } else {
+                    let mut cursor = Some(node_id);
+                    while let Some(curr) = cursor {
+                        if page.videos.contains_key(&curr) {
+                            page.focused_input = None;
+                            let vrect = page.find_layout_rect(curr).unwrap_or(Rect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 240.0,
+                                height: 120.0,
+                            });
+                            let rel_x = (page_x - vrect.x).max(0.0);
+                            let rel_y = (page_y - vrect.y).max(0.0);
+                            let in_scrubber =
+                                rel_y >= (vrect.height - 26.0).max(0.0) && rel_x >= 32.0;
+                            if let Some(player) = page.videos.get_mut(&curr) {
+                                if in_scrubber {
+                                    let track_w = (vrect.width - 42.0).max(1.0);
+                                    let ratio = ((rel_x - 32.0) / track_w).clamp(0.0, 1.0);
+                                    let target_ms = ((player.duration_ms as f32 * ratio).round()
+                                        as u32)
+                                        .min(player.duration_ms);
+                                    player.seek_to_ms(target_ms);
+                                    if let Some(surface) = player.render_surface() {
+                                        page.images.insert(curr, surface);
+                                    }
+                                    page.restage(viewport);
+                                    return ClickOutcome::VideoSeeked(curr, target_ms);
+                                } else {
+                                    player.playing = !player.playing;
+                                    let playing = player.playing;
+                                    if playing {
+                                        let step = (1000 / player.clip.fps.max(1)).max(33);
+                                        player.step_by_ms(step);
+                                    }
+                                    if let Some(surface) = player.render_surface() {
+                                        page.images.insert(curr, surface);
+                                    }
+                                    page.restage(viewport);
+                                    return ClickOutcome::VideoToggled(curr, playing);
                                 }
-                                page.restage(viewport);
-                                return ClickOutcome::VideoSeeked(curr, target_ms);
-                            } else {
-                                player.playing = !player.playing;
-                                let playing = player.playing;
-                                if playing {
-                                    let step = (1000 / player.clip.fps.max(1)).max(33);
-                                    player.step_by_ms(step);
-                                }
-                                if let Some(surface) = player.render_surface() {
-                                    page.images.insert(curr, surface);
-                                }
-                                page.restage(viewport);
-                                return ClickOutcome::VideoToggled(curr, playing);
                             }
                         }
+                        if page.document.is_text_input(curr) {
+                            page.focused_input = Some(curr);
+                            page.restage(viewport);
+                            return ClickOutcome::InputFocused(curr);
+                        }
+                        if page.document.is_checkbox_input(curr) {
+                            page.focused_input = None;
+                            let checked = page.document.toggle_checked(curr);
+                            page.restage(viewport);
+                            return ClickOutcome::CheckboxToggled(curr, checked);
+                        }
+                        if page.document.is_select_control(curr) {
+                            page.focused_input = None;
+                            let val = page.document.cycle_select_option(curr).unwrap_or_default();
+                            page.restage(viewport);
+                            return ClickOutcome::SelectChanged(curr, val);
+                        }
+                        if page.document.is_submit_control(curr) {
+                            page.focused_input = None;
+                            submit_control = Some(curr);
+                            break;
+                        }
+                        cursor = page.document.get(curr).parent();
                     }
-                    if page.document.is_text_input(curr) {
-                        page.focused_input = Some(curr);
-                        page.restage(viewport);
-                        return ClickOutcome::InputFocused(curr);
-                    }
-                    if page.document.is_checkbox_input(curr) {
-                        page.focused_input = None;
-                        let checked = page.document.toggle_checked(curr);
-                        page.restage(viewport);
-                        return ClickOutcome::CheckboxToggled(curr, checked);
-                    }
-                    if page.document.is_select_control(curr) {
-                        page.focused_input = None;
-                        let val = page.document.cycle_select_option(curr).unwrap_or_default();
-                        page.restage(viewport);
-                        return ClickOutcome::SelectChanged(curr, val);
-                    }
-                    if page.document.is_submit_control(curr) {
-                        page.focused_input = None;
-                        submit_control = Some(curr);
-                        break;
-                    }
-                    cursor = page.document.get(curr).parent();
                 }
             }
-            if page.focused_input.take().is_some() {
+            if script_outcome.is_none() && page.focused_input.take().is_some() {
                 page.restage(viewport);
             }
+        }
+        if let Some(rows) = harvested_storage {
+            self.merge_local_storage(rows);
+        }
+        if let Some(outcome) = script_outcome {
+            if matches!(outcome, ClickOutcome::ScriptHandled) {
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+            }
+            return outcome;
         }
         if let Some(ctrl_id) = submit_control {
             return self.submit_form_for(ctrl_id);
@@ -1419,10 +1659,12 @@ impl Session {
         ClickOutcome::None
     }
 
+    /// Bookmark slice in insertion order.
     pub fn bookmarks(&self) -> &[Bookmark] {
         &self.bookmarks
     }
 
+    /// True when the active page URL is already bookmarked.
     pub fn is_active_bookmarked(&self) -> bool {
         let Some(page) = self.active().current() else {
             return false;
@@ -1430,6 +1672,7 @@ impl Session {
         !page.url.is_empty() && self.bookmarks.iter().any(|b| b.url == page.url)
     }
 
+    /// Append a bookmark when `url` is non-empty and not already stored.
     pub fn add_bookmark(&mut self, title: &str, url: &str) -> bool {
         let url = url.trim();
         if url.is_empty() || self.bookmarks.iter().any(|b| b.url == url) {
@@ -1447,12 +1690,14 @@ impl Session {
         true
     }
 
+    /// Remove every bookmark whose URL equals `url`.
     pub fn remove_bookmark(&mut self, url: &str) -> bool {
         let before = self.bookmarks.len();
         self.bookmarks.retain(|b| b.url != url);
         self.bookmarks.len() != before
     }
 
+    /// Remove the active URL, or add it. Returns whether it is bookmarked afterward.
     pub fn toggle_bookmark_active(&mut self) -> bool {
         let Some(page) = self.active().current() else {
             return false;
@@ -1469,12 +1714,14 @@ impl Session {
         }
     }
 
+    /// Raster the active display list. An empty tab is a white frame of the viewport size.
     pub fn rasterize(&self) -> Framebuffer {
         let width = (self.viewport.width.round() as u32).max(1);
         let height = (self.viewport.height.round() as u32).max(1);
         let Some(page) = self.active().current() else {
             return Framebuffer::new(width, height, PAPER);
         };
+        // Raster step, after paint. Zoom other than 100 scales the display list first.
         if self.zoom_percent == 100 {
             rasterize(&page.display_list, width, height, self.scroll)
         } else {
@@ -1483,26 +1730,32 @@ impl Session {
         }
     }
 
+    /// Tab slice. Each entry is an in-process history stack.
     pub fn tabs(&self) -> &[Tab] {
         &self.tabs
     }
 
+    /// Number of tabs.
     pub fn len(&self) -> usize {
         self.tabs.len()
     }
 
+    /// True when `tabs` is empty. `new` starts with one tab, so a new session is not empty.
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
 
+    /// Index passed to `select`.
     pub fn active_index(&self) -> usize {
         self.active
     }
 
+    /// The selected tab.
     pub fn active(&self) -> &Tab {
         &self.tabs[self.active]
     }
 
+    /// Select `index` and reset scroll. Returns false when `index` is out of range.
     pub fn select(&mut self, index: usize) -> bool {
         if index >= self.tabs.len() {
             return false;
@@ -1512,12 +1765,14 @@ impl Session {
         true
     }
 
+    /// Push an empty tab and select it. Scroll is reset.
     pub fn new_tab(&mut self) {
         self.tabs.push(Tab::empty());
         self.active = self.tabs.len() - 1;
         self.scroll = 0.0;
     }
 
+    /// Remove `index` when more than one tab exists, and keep `active` in range.
     pub fn close_tab(&mut self, index: usize) -> bool {
         if self.tabs.len() <= 1 || index >= self.tabs.len() {
             return false;
@@ -1532,14 +1787,22 @@ impl Session {
         true
     }
 
-    pub fn open_page(&mut self, page: Page) {
+    /// Record history, merge `localStorage`, push `page` on the active tab, and reset scroll.
+    pub fn open_page(&mut self, mut page: Page) {
         self.record_history(&page);
+        let rows = page.runtime.export_local_storage();
+        self.merge_local_storage(rows);
+        page.runtime.import_local_storage(&self.local_storage);
         self.tabs[self.active].navigate(page);
         self.scroll = 0.0;
     }
 
-    pub fn open_page_in_tab(&mut self, tab_index: usize, page: Page) {
+    /// Record history, merge `localStorage`, and push `page` on `tab_index` when that tab exists.
+    pub fn open_page_in_tab(&mut self, tab_index: usize, mut page: Page) {
         self.record_history(&page);
+        let rows = page.runtime.export_local_storage();
+        self.merge_local_storage(rows);
+        page.runtime.import_local_storage(&self.local_storage);
         if let Some(tab) = self.tabs.get_mut(tab_index) {
             tab.navigate(page);
             if tab_index == self.active {
@@ -1548,6 +1811,7 @@ impl Session {
         }
     }
 
+    /// Append a history row unless the URL is empty, repeated, or a history, downloads, or inspect page.
     fn record_history(&mut self, page: &Page) {
         let url = page.url.trim();
         if url.is_empty()
@@ -1571,21 +1835,27 @@ impl Session {
         });
     }
 
+    /// Render `html` inside `execute_isolated`. A caught panic becomes the recovery page.
     pub fn open_html(&mut self, html: &str, url: &str) {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
-        let page = match self
-            .sandbox_guard
-            .execute_isolated(&label, || Ok(render_html(html, url, viewport)))
-        {
+        let seeded_storage = self.local_storage.clone();
+        let page = match self.sandbox_guard.execute_isolated(&label, || {
+            Ok(render_html_with_storage(
+                html,
+                url,
+                viewport,
+                &seeded_storage,
+            ))
+        }) {
             Ok(p) => p,
             Err(err) => render_sandbox_recovery_page(url, &err.to_string(), viewport),
         };
         self.open_page(page);
     }
 
-    /// Run a tab workload and catch a panic from it.
-    /// If the workload faults or panics, only the active tab displays a recovery card.
+    /// Run `workload` on this thread through `execute_isolated`.
+    /// A panic or `Err` becomes the recovery page on the active tab. No child process is started.
     pub fn open_isolated_workload<F>(&mut self, url: &str, workload: F)
     where
         F: FnOnce(Viewport) -> Result<Page, String>,
@@ -1602,6 +1872,7 @@ impl Session {
         self.open_page(page);
     }
 
+    /// Upgrade `url` with HSTS, load it inside `execute_isolated`, and open the page or the recovery page.
     pub fn open_url(&mut self, url: &str) -> Result<(), BrowserError> {
         let upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
         let viewport = self.viewport;
@@ -1624,6 +1895,12 @@ impl Session {
         }
     }
 
+    /// Open a built-in `flux://` page or another target.
+    ///
+    /// Settings query flags toggle in-memory settings and then render the settings
+    /// page. Sample download actions only record bytes. They do not save a file.
+    /// http(s) and files go through `load_target` inside `execute_isolated`.
+    /// This does not spawn `--tab-worker`.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -1641,7 +1918,12 @@ impl Session {
                 self.settings.search_engine = SearchEngine::Google;
             }
             let html = frontend::home_html_with_engine(self.settings.search_engine);
-            let page = render_html(&html, frontend::HOME_URL, self.viewport);
+            let page = render_html_with_storage(
+                &html,
+                frontend::HOME_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             self.open_page(page);
             return Ok(());
         }
@@ -1665,7 +1947,12 @@ impl Session {
                 self.downloads.entries().len(),
                 self.cookie_jar.len(),
             );
-            let page = render_html(&html, frontend::INSPECT_URL, self.viewport);
+            let page = render_html_with_storage(
+                &html,
+                frontend::INSPECT_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             self.open_page(page);
             return Ok(());
         }
@@ -1708,7 +1995,9 @@ impl Session {
                 self.history_log.len(),
                 self.cookie_jar.len(),
             );
-            let mut page = render_html(&html, frontend::SETTINGS_URL, self.viewport);
+            let mut page =
+                render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
+            page.url = frontend::SETTINGS_URL.to_string();
             page.runtime.set_jit_enabled(self.settings.jit_enabled);
             self.open_page(page);
             return Ok(());
@@ -1718,7 +2007,12 @@ impl Session {
                 self.clear_history_log();
             }
             let html = frontend::history_html_with_entries(&self.history_log);
-            let page = render_html(&html, frontend::HISTORY_URL, self.viewport);
+            let page = render_html_with_storage(
+                &html,
+                frontend::HISTORY_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             self.open_page(page);
             return Ok(());
         }
@@ -1746,7 +2040,12 @@ impl Session {
                 }
             }
             let html = frontend::downloads_html_with_entries(self.downloads.entries());
-            let page = render_html(&html, frontend::DOWNLOADS_URL, self.viewport);
+            let page = render_html_with_storage(
+                &html,
+                frontend::DOWNLOADS_URL,
+                self.viewport,
+                &self.local_storage,
+            );
             self.open_page(page);
             return Ok(());
         }
@@ -1816,7 +2115,7 @@ impl Session {
         stepped
     }
 
-    /// Capture the current session state into a [`ProfileSnapshot`].
+    /// Copy settings, zoom, tab URLs, bookmarks, history, cookies, HSTS, downloads, and `localStorage` into a snapshot.
     pub fn to_profile_snapshot(&self) -> ProfileSnapshot {
         let mut tab_urls = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
@@ -1835,10 +2134,12 @@ impl Session {
             cookie_jar: self.cookie_jar.clone(),
             hsts_store: self.hsts_store.clone(),
             downloads: self.downloads.clone(),
+            local_storage: self.local_storage.clone(),
         }
     }
 
-    /// Apply a restored [`ProfileSnapshot`] into this session.
+    /// Copy settings, zoom, bookmarks, history, cookies, HSTS, downloads, and `localStorage` from `snapshot`.
+    /// `tab_urls` and `active_tab` are stored but not applied. Duplicate bookmark URLs are skipped.
     pub fn apply_profile_snapshot(&mut self, snapshot: ProfileSnapshot) -> usize {
         self.settings = snapshot.settings;
         self.gpu_video.set_hardware_acceleration(
@@ -1860,17 +2161,21 @@ impl Session {
         self.cookie_jar = snapshot.cookie_jar;
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
+        self.merge_local_storage(snapshot.local_storage);
+        if let Some(page) = self.tabs[self.active].current_mut() {
+            page.runtime.import_local_storage(&self.local_storage);
+        }
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
         added
     }
 
-    /// Save an encrypted & authenticated `FLXP\x01` profile container to `path`.
+    /// Write the sealed profile to `path`. Windows uses DPAPI (`FLXP\x01`). Linux uses AES-256-GCM (`FLXP\x02`).
     pub fn save_encrypted_profile(&self, path: &str) -> Result<(), String> {
         let snap = self.to_profile_snapshot();
         profile::save_encrypted_profile_to_path(&snap, Path::new(path)).map_err(|e| e.to_string())
     }
 
-    /// Load an encrypted `FLXP\x01` (or JSON) profile from `path` into this session.
+    /// Load `path` and apply it. Accepts JSON, Windows `FLXP\x01`, and Linux `FLXP\x02`.
     pub fn load_encrypted_profile(&mut self, path: &str) -> Result<usize, String> {
         let snap = profile::load_profile_from_path(Path::new(path)).map_err(|e| e.to_string())?;
         Ok(self.apply_profile_snapshot(snap))
@@ -1897,13 +2202,15 @@ impl Session {
         Ok(self.apply_profile_snapshot(snap))
     }
 
-    /// Clear all bookmarks, browsing history, cookies, and reset settings to defaults.
+    /// Clear bookmarks, history, cookies, HSTS, downloads, and `localStorage`, then reset settings and zoom.
+    /// Deletes the default `profile.flx` when that path exists. Does not clear the session clipboard.
     pub fn clear_all_profile_data(&mut self) {
         self.bookmarks.clear();
         self.history_log.clear();
         self.cookie_jar = CookieJar::new();
         self.hsts_store = HstsStore::new();
         self.downloads.clear();
+        self.local_storage.clear();
         self.settings = BrowserSettings::default();
         self.zoom_percent = 100;
         if let Some(path) = default_profile_path() {
@@ -1911,6 +2218,7 @@ impl Session {
         }
     }
 
+    /// Load the active URL again and replace the current history entry. Scroll is clamped, not reset.
     pub fn reload_active(&mut self) -> Result<(), String> {
         let Some(current) = self.tabs[self.active].current() else {
             return Ok(());
@@ -1942,6 +2250,7 @@ impl Session {
         }
     }
 
+    /// Move the active tab back and reset scroll.
     pub fn back(&mut self) -> bool {
         let moved = self.tabs[self.active].back();
         if moved {
@@ -1950,6 +2259,7 @@ impl Session {
         moved
     }
 
+    /// Move the active tab forward and reset scroll.
     pub fn forward(&mut self) -> bool {
         let moved = self.tabs[self.active].forward();
         if moved {
@@ -1984,6 +2294,7 @@ impl Session {
         to_json_pretty(&root)
     }
 
+    /// Add bookmarks from a JSON `bookmarks` array. Returns how many URLs were new.
     pub fn import_bookmarks_from_json(&mut self, json_src: &str) -> Result<usize, String> {
         let doc = parse_json(json_src).map_err(|e| e.to_string())?;
         let Some(items) = doc.get("bookmarks").and_then(JsonValue::as_array) else {
@@ -2000,10 +2311,12 @@ impl Session {
         Ok(added)
     }
 
+    /// Write `export_json` to `path`. This is plain JSON, not the sealed profile.
     pub fn save_profile(&self, path: &str) -> Result<(), String> {
         fs::write(path, self.export_json()).map_err(|e| e.to_string())
     }
 
+    /// Read `path` as text and import bookmarks. This does not open `profile.flx`.
     pub fn load_profile(&mut self, path: &str) -> Result<usize, String> {
         let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
         self.import_bookmarks_from_json(&raw)
@@ -2025,6 +2338,7 @@ impl Session {
     }
 }
 
+/// HTML card shown when `execute_isolated` returns a fault. `reason` is inserted as text.
 fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> Page {
     let html = format!(
         "<!DOCTYPE html>
@@ -2054,16 +2368,61 @@ fn render_sandbox_recovery_page(url: &str, reason: &str, viewport: Viewport) -> 
 
 #[cfg(test)]
 mod tests {
+    //! In-process checks for loading, history, forms, and video. They do not spawn `--tab-worker`.
     use super::*;
     use flux_paint::DisplayItem;
     use flux_style::Color;
 
     #[test]
-    fn release_is_v16() {
-        assert_eq!(VERSION, "v.16");
+    /// `VERSION` is the string `v.17`.
+    fn release_is_v17() {
+        assert_eq!(VERSION, "v.17");
     }
 
     #[test]
+    /// Persist `localStorage` across pages and through an encrypted `profile.flx` snapshot.
+    fn persists_origin_isolated_local_storage_in_encrypted_profile() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<p id=\"out\"></p>
+             <script>
+               localStorage.setItem('theme', 'obsidian-gold');
+               document.getElementById('out').textContent = localStorage.getItem('theme');
+             </script>",
+            "https://example.com/dashboard.html",
+        );
+        assert!(session.local_storage_entries().contains(&(
+            "https://example.com".to_string(),
+            "theme".to_string(),
+            "obsidian-gold".to_string()
+        )));
+
+        let snap = session.to_profile_snapshot();
+        let encrypted = profile::encode_encrypted_profile(&snap, 0x1122_3344_5566_7788);
+        let decoded = profile::decode_profile_bytes(&encrypted).expect("decode profile");
+
+        let mut restored = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        restored.apply_profile_snapshot(decoded);
+        restored.open_html(
+            "<p id=\"restored\"></p>
+             <script>
+               document.getElementById('restored').textContent = localStorage.getItem('theme');
+             </script>",
+            "https://example.com/settings.html",
+        );
+        let page = restored.active().current().unwrap();
+        let node = page.document.get_element_by_id("restored").unwrap();
+        assert_eq!(page.document.text_content(node), "obsidian-gold");
+    }
+
+    #[test]
+    /// An encrypted demo video sets the page title from script, then sample downloads are recorded and cleared.
     fn supports_w3c_eme_cenc_encrypted_video_and_sha256_download_manager() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2109,6 +2468,7 @@ mod tests {
     }
 
     #[test]
+    /// HSTS upgrade, an SRI match and mismatch, and a sealed snapshot round-trip.
     fn enforces_hsts_sri_and_dpapi_profile_protection_in_session() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2141,6 +2501,7 @@ mod tests {
     }
 
     #[test]
+    /// Play and seek a demo video, then restore zoom and one bookmark from a sealed snapshot.
     fn supports_encrypted_profile_persistence_and_interactive_video_scrubbing() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2191,6 +2552,7 @@ mod tests {
     }
 
     #[test]
+    /// Round-trip a WebP and an ICO through `flux-image`, and read width and height from a demo MP4.
     fn integrates_webp_ico_images_and_hardened_mp4_video_metadata() {
         let mut src = Image::new(16, 16);
         src.set_pixel(4, 4, [255, 200, 80, 180]);
@@ -2213,6 +2575,7 @@ mod tests {
     }
 
     #[test]
+    /// Sandbox telemetry, a blocked inline script, a caught panic on the second tab, and an HttpOnly cookie.
     fn enforces_hardcoded_os_sandbox_csp_and_cookie_isolation_in_session() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2270,6 +2633,7 @@ mod tests {
     }
 
     #[test]
+    /// Find-in-page hits, zoom steps, raster size, and cut plus paste on the session clipboard.
     fn supports_find_in_page_zoom_and_clipboard_operations() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2337,6 +2701,7 @@ mod tests {
     }
 
     #[test]
+    /// Cycle a select, build its POST body, and restage a max-width media query.
     fn restages_media_queries_and_cycles_select_controls() {
         let mut session = Session::new(Viewport {
             width: 800.0,
@@ -2393,6 +2758,7 @@ mod tests {
     }
 
     #[test]
+    /// Load home, security, navigate, settings, and history, and flip the video-acceleration flag.
     fn loads_builtin_flux_home_security_settings_and_history_with_gpu_video() {
         let vp = Viewport {
             width: 960.0,
@@ -2439,6 +2805,7 @@ mod tests {
     }
 
     #[test]
+    /// Render `examples/hello.html` and check the title plus two paint colors.
     fn renders_the_sample_page() {
         let page = render_html(
             include_str!("../../../examples/hello.html"),
@@ -2467,6 +2834,7 @@ mod tests {
     }
 
     #[test]
+    /// The external sheet is applied first. The later embedded rule keeps the paragraph color.
     fn applies_external_stylesheet_before_embedded_rules() {
         let page = render_html_with_css(
             "<style>p { color: #00ff00; }</style><h1>Heading</h1><p>Body</p>",
@@ -2491,6 +2859,7 @@ mod tests {
     }
 
     #[test]
+    /// Back and forward work until a new page drops the forward entry.
     fn history_drops_the_forward_page() {
         let mut session = Session::new(Viewport {
             width: 200.0,
@@ -2510,6 +2879,7 @@ mod tests {
     }
 
     #[test]
+    /// A new tab has no page. Closing it returns to the previous tab. The last tab stays open.
     fn a_new_tab_starts_empty_and_can_close() {
         let mut session = Session::new(Viewport {
             width: 100.0,
@@ -2526,6 +2896,7 @@ mod tests {
     }
 
     #[test]
+    /// Resolve a relative href, then scroll until that point is no longer the link.
     fn hits_a_relative_link_and_scrolls_the_viewport() {
         let mut session = Session::new(Viewport {
             width: 200.0,
@@ -2552,6 +2923,7 @@ mod tests {
     }
 
     #[test]
+    /// A click listener changes the document title and the paragraph text.
     fn dispatches_script_click_and_restages_page() {
         let mut session = Session::new(Viewport {
             width: 200.0,
@@ -2580,6 +2952,7 @@ mod tests {
     }
 
     #[test]
+    /// `export_json` keeps both tab URLs in open order.
     fn exports_and_parses_session_tabs_via_flux_json() {
         let mut session = Session::new(Viewport {
             width: 400.0,
@@ -2601,6 +2974,7 @@ mod tests {
     }
 
     #[test]
+    /// Focus a text field, edit it, build a POST body, and import the bookmark from exported JSON.
     fn focuses_input_types_text_submits_form_and_persists_bookmarks() {
         let mut session = Session::new(Viewport {
             width: 320.0,

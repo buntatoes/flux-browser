@@ -1,51 +1,99 @@
-//! Content Security Policy, Cross-Origin Resource Policy, and a cookie jar
-//! (`HttpOnly`, `Secure`, `SameSite`, `__Host-`, `__Secure-`).
+//! Content Security Policy, Cross-Origin Resource Policy, cookies, HSTS, and SHA-256 SRI.
+//!
+//! This module does not open sockets and does not speak TLS. [`crate::fetch`]
+//! and [`crate::fetch_post`] use [`CookieJar`] while following redirects.
+//! `flux-browser` also keeps a [`CookieJar`] and an [`HstsStore`] on the
+//! session and calls [`ContentSecurityPolicy`], [`allows_corp_subresource`],
+//! and [`verify_subresource_integrity`] when it loads a page.
+//! Snapshots use `flux-json` with a depth cap of 16 and a 1 MiB cap.
+//!
+//! Limits: [`MAX_COOKIES_TOTAL`], [`MAX_COOKIES_PER_HOST`], [`MAX_COOKIE_BYTES`],
+//! and [`MAX_HSTS_HOSTS`]. There is no public-suffix list. Same-site is the
+//! scheme plus the last two hostname labels. HSTS `max-age` is stored but not
+//! compared to a clock. Preloaded HSTS hosts are fixed in this file.
 
 use crate::{is_same_origin, parse_url, resolve_url};
 use flux_json::{JsonValue, parse_json_bounded, to_json_string};
 
-/// Maximum total cookies retained in the session jar.
+/// Maximum cookies kept in one [`CookieJar`].
+///
+/// When a new cookie would exceed this, the oldest entry is dropped.
 pub const MAX_COOKIES_TOTAL: usize = 256;
 
-/// Maximum cookies retained for a single host.
+/// Maximum cookies kept for one domain string.
+///
+/// When a new cookie would exceed this, the oldest cookie with that domain is dropped.
 pub const MAX_COOKIES_PER_HOST: usize = 32;
 
-/// Maximum byte length of a single cookie `name=value` pair.
+/// Maximum byte length of one `Set-Cookie` header value.
+///
+/// A longer value is rejected and not stored.
 pub const MAX_COOKIE_BYTES: usize = 4096;
 
+/// Fetch directive names this parser keeps.
+///
+/// Any other CSP directive name is ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CspDirective {
+    /// `default-src`. Also the fallback when a specific list is empty.
     DefaultSrc,
+    /// `script-src`.
     ScriptSrc,
+    /// `style-src`.
     StyleSrc,
+    /// `img-src`.
     ImgSrc,
+    /// `media-src`.
     MediaSrc,
+    /// `connect-src`.
     ConnectSrc,
 }
 
+/// One source expression from a CSP directive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CspSource {
+    /// `'none'`. Denies the directive even if other sources are present.
     None,
+    /// `'self'`. Same scheme, host, and port as the page.
     SelfOrigin,
+    /// `'unsafe-inline'`. Consulted only by the inline script and style checks.
     UnsafeInline,
+    /// A scheme token such as `https:` stored without the trailing colon.
     Scheme(String),
+    /// A host, or a full origin when the token contains `://`.
     Host(String),
+    /// `*` or a `*.suffix` host. The suffix itself also matches.
     WildcardSubdomain(String),
 }
 
-/// Parsed `Content-Security-Policy` (`CSP`) ruleset for a document.
+/// Parsed `Content-Security-Policy` header.
+///
+/// Only `default-src`, `script-src`, `style-src`, `img-src`, `media-src`, and
+/// `connect-src` are stored. A repeated directive replaces the earlier list.
+/// An empty list means that directive was absent. Resource and inline checks
+/// then fall back to `default-src`. If that is also empty, the check allows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContentSecurityPolicy {
+    /// `default-src` sources. Fallback when a specific list above is empty.
     pub default_src: Vec<CspSource>,
+    /// `script-src` sources. Empty means use `default_src`.
     pub script_src: Vec<CspSource>,
+    /// `style-src` sources. Empty means use `default_src`.
     pub style_src: Vec<CspSource>,
+    /// `img-src` sources. Empty means use `default_src`.
     pub img_src: Vec<CspSource>,
+    /// `media-src` sources. Empty means use `default_src`.
     pub media_src: Vec<CspSource>,
+    /// `connect-src` sources. Empty means use `default_src`.
     pub connect_src: Vec<CspSource>,
 }
 
 impl ContentSecurityPolicy {
-    /// Parse a `Content-Security-Policy` header string into structured directives.
+    /// Parse a `Content-Security-Policy` header.
+    ///
+    /// Directives are split on `;`. The first token is the name. Remaining
+    /// tokens are sources. Unknown directive names are dropped. An empty
+    /// header yields empty lists, which allow every check.
     pub fn parse(header: &str) -> Self {
         let mut csp = Self::default();
         for raw_directive in header.split(';') {
@@ -71,6 +119,7 @@ impl ContentSecurityPolicy {
         csp
     }
 
+    /// Specific directive list, or `default-src` when that list is empty.
     fn effective_sources(&self, directive: CspDirective) -> &[CspSource] {
         let specific = match directive {
             CspDirective::DefaultSrc => &self.default_src,
@@ -87,7 +136,10 @@ impl ContentSecurityPolicy {
         }
     }
 
-    /// Check whether inline `<script>` execution is permitted under this policy.
+    /// Whether inline script is allowed.
+    ///
+    /// An empty effective list allows. `'none'` denies, including when
+    /// `'unsafe-inline'` is also present. Otherwise `'unsafe-inline'` is required.
     pub fn allows_inline_script(&self) -> bool {
         let sources = self.effective_sources(CspDirective::ScriptSrc);
         if sources.is_empty() {
@@ -99,7 +151,7 @@ impl ContentSecurityPolicy {
         sources.contains(&CspSource::UnsafeInline)
     }
 
-    /// Check whether inline `<style>` execution is permitted under this policy.
+    /// Whether inline style is allowed. Same rule as [`Self::allows_inline_script`] for `style-src`.
     pub fn allows_inline_style(&self) -> bool {
         let sources = self.effective_sources(CspDirective::StyleSrc);
         if sources.is_empty() {
@@ -111,7 +163,12 @@ impl ContentSecurityPolicy {
         sources.contains(&CspSource::UnsafeInline)
     }
 
-    /// Check whether loading `target_url` from `page_url` is permitted for `directive`.
+    /// Whether `directive` allows `target_url` from `page_url`.
+    ///
+    /// An empty effective list allows. `'none'` denies the whole directive.
+    /// `'unsafe-inline'` does not match a URL. Other sources are tried in order
+    /// and the first match allows. No match denies.
+    /// `target_url` is resolved against `page_url` when [`resolve_url`] accepts it.
     pub fn allows_resource(
         &self,
         directive: CspDirective,
@@ -128,6 +185,7 @@ impl ContentSecurityPolicy {
         let resolved = resolve_url(page_url, target_url).unwrap_or_else(|| target_url.to_string());
         for src in sources {
             match src {
+                // 'none' already denied above. 'unsafe-inline' never matches a URL.
                 CspSource::None | CspSource::UnsafeInline => {}
                 CspSource::SelfOrigin => {
                     if is_same_origin(page_url, &resolved) {
@@ -147,6 +205,7 @@ impl ContentSecurityPolicy {
                     }
                 }
                 CspSource::WildcardSubdomain(suffix) => {
+                    // `*` allows the target without parsing it.
                     if suffix == "*" {
                         return true;
                     }
@@ -162,6 +221,8 @@ impl ContentSecurityPolicy {
                     }
                 }
                 CspSource::Host(host_expr) => {
+                    // A token that contains `://` must match scheme, host, and port.
+                    // Any other host token must match the target host exactly.
                     if host_expr.contains("://") {
                         if is_same_origin(host_expr, &resolved) {
                             return true;
@@ -178,6 +239,12 @@ impl ContentSecurityPolicy {
     }
 }
 
+/// Map one CSP source token to [`CspSource`].
+///
+/// Recognizes `'none'`, `'self'`, `'unsafe-inline'`, `*`, a scheme ending in
+/// `:`, and `*.suffix`. Every other token, including an unknown quoted keyword,
+/// becomes [`CspSource::Host`] with surrounding quotes removed. Nothing fails
+/// the parse. Matching happens later in [`ContentSecurityPolicy::allows_resource`].
 fn parse_csp_source(token: &str) -> CspSource {
     let clean = token.trim().to_ascii_lowercase();
     match clean.as_str() {
@@ -195,7 +262,11 @@ fn parse_csp_source(token: &str) -> CspSource {
     }
 }
 
-/// Evaluate a response's `Cross-Origin-Resource-Policy` (`CORP`) header for subresource loads.
+/// Whether CORP allows a subresource.
+///
+/// A missing header, an empty value, and `cross-origin` allow. `same-origin`
+/// requires the same scheme, host, and port. `same-site` uses [`is_same_site`].
+/// Any other token denies.
 pub fn allows_corp_subresource(
     corp_header: Option<&str>,
     page_url: &str,
@@ -212,7 +283,11 @@ pub fn allows_corp_subresource(
     }
 }
 
-/// Check whether two URLs share the same registrable site (`scheme` + registrable domain).
+/// Whether two URLs share a scheme and a registrable domain.
+///
+/// Same origin is same-site. Otherwise both URLs must parse, the schemes must
+/// be equal, and the last two hostname labels must match. A URL that does not parse
+/// is not same-site unless [`is_same_origin`] already returned true.
 pub fn is_same_site(a_url: &str, b_url: &str) -> bool {
     if is_same_origin(a_url, b_url) {
         return true;
@@ -226,6 +301,10 @@ pub fn is_same_site(a_url: &str, b_url: &str) -> bool {
     registrable_domain(&a.host) == registrable_domain(&b.host)
 }
 
+/// Last two dot-separated labels, lowercased.
+///
+/// A host with fewer than two labels is returned lowercased as a whole.
+/// This is not a public-suffix list: `example.co.uk` yields `co.uk`.
 fn registrable_domain(host: &str) -> String {
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 2 {
@@ -235,14 +314,21 @@ fn registrable_domain(host: &str) -> String {
     }
 }
 
+/// `SameSite` attribute stored on a cookie.
+///
+/// A missing or unrecognized attribute is stored as [`SameSite::Lax`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SameSite {
+    /// Sent only when the initiator and the target are same-site.
     Strict,
+    /// Sent on same-site requests, and on cross-site top-level GET requests.
     Lax,
+    /// Sent on cross-site requests only when the cookie is `Secure` and the target is `https`.
     None,
 }
 
 impl SameSite {
+    /// Canonical attribute spelling used in JSON snapshots.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Strict => "Strict",
@@ -251,6 +337,10 @@ impl SameSite {
         }
     }
 
+    /// Parse a `SameSite` attribute.
+    ///
+    /// `strict` and `none` are recognized. Every other value, including an empty
+    /// string, becomes [`SameSite::Lax`].
     pub fn from_str_attr(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "strict" => Self::Strict,
@@ -260,51 +350,83 @@ impl SameSite {
     }
 }
 
+/// One stored cookie.
+///
+/// `Expires` is not a field. Only `Max-Age` is read on input, and a positive
+/// `Max-Age` is not stored, so nothing here expires by time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cookie {
+    /// Cookie name, including any `__Host-` or `__Secure-` prefix.
     pub name: String,
+    /// Cookie value. Not decoded.
     pub value: String,
+    /// Host-only host, or the `Domain` attribute without a leading dot.
     pub domain: String,
+    /// True when no `Domain` attribute was accepted. Match is exact host only.
     pub host_only: bool,
+    /// Path prefix. Defaults to `/` when the attribute is absent or does not start with `/`.
     pub path: String,
+    /// `Secure` flag. Sent only to `https`, and stored only from `https`.
     pub secure: bool,
+    /// `HttpOnly` flag. Sent on the HTTP header and omitted from script access.
     pub http_only: bool,
+    /// `SameSite` mode. Missing attributes are stored as [`SameSite::Lax`].
     pub same_site: SameSite,
 }
 
-/// Hardened RFC 6265bis Cookie Jar enforcing `HttpOnly`, `Secure`, `SameSite`,
-/// and `__Host-` / `__Secure-` cookie prefixes.
+/// Session cookie jar.
+///
+/// `Secure` is required to store a `Secure` cookie and to send it.
+/// `HttpOnly` is stored and is included on the HTTP `Cookie` header, but
+/// [`Self::script_cookie_string`] omits it. `SameSite=None` is rejected unless
+/// `Secure` is set. `__Secure-` requires `Secure` on `https`. `__Host-` also
+/// requires `Path=/` and no `Domain`. `Expires` is ignored. There is no
+/// eviction by time, only by [`MAX_COOKIES_PER_HOST`] and [`MAX_COOKIES_TOTAL`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
 }
 
 impl CookieJar {
+    /// Empty jar.
     pub fn new() -> Self {
         Self {
             cookies: Vec::new(),
         }
     }
 
+    /// Number of stored cookies.
     pub fn len(&self) -> usize {
         self.cookies.len()
     }
 
+    /// Whether the jar holds no cookies.
     pub fn is_empty(&self) -> bool {
         self.cookies.is_empty()
     }
 
+    /// Drop every cookie.
     pub fn clear(&mut self) {
         self.cookies.clear();
     }
 
+    /// Stored cookies in insertion order, after eviction of older entries.
     pub fn cookies(&self) -> &[Cookie] {
         &self.cookies
     }
 
-    /// Parse and store a `Set-Cookie` header received from `request_url`.
-    /// Rejects insecure `SameSite=None`, forged domains, control characters, and violated
-    /// `__Host-` / `__Secure-` prefix invariants.
+    /// Parse and store one `Set-Cookie` value received from `request_url`.
+    ///
+    /// Returns `false` without changing the jar when the value is too long, contains
+    /// a byte below 0x20 or 0x7F, the request URL does not parse, the name is empty
+    /// or contains a cookie separator, `Secure` was set on a non-`https` response,
+    /// `SameSite=None` lacks `Secure`, a `__Secure-` or `__Host-` prefix rule fails,
+    /// or the `Domain` is not a suffix of the request host or has no dot.
+    ///
+    /// Returns `true` after deleting a match when `Max-Age` is zero or negative.
+    /// A positive `Max-Age` does not set a lifetime. `Expires` is ignored.
+    /// An existing name, domain, and path is updated in place. A `Secure` cookie
+    /// is not updated from a non-`https` response.
     pub fn store_set_cookie(&mut self, request_url: &str, header_value: &str) -> bool {
         if header_value.len() > MAX_COOKIE_BYTES
             || header_value.bytes().any(|b| b < 0x20 || b == 0x7F)
@@ -381,7 +503,7 @@ impl CookieJar {
             }
         }
 
-        // Enforce Secure transport for Secure cookies and SameSite=None
+        // Secure cookies are accepted only from https. SameSite=None also requires Secure.
         if secure && !is_https {
             return false;
         }
@@ -389,7 +511,7 @@ impl CookieJar {
             return false;
         }
 
-        // Enforce __Secure- and __Host- cookie prefix rules (RFC 6265bis)
+        // __Secure- requires Secure on https. __Host- also forbids Domain and requires Path=/.
         if name.starts_with("__Secure-") && !(secure && is_https) {
             return false;
         }
@@ -410,6 +532,7 @@ impl CookieJar {
         };
         let path = path_attr.unwrap_or_else(|| "/".to_string());
 
+        // Max-Age of 0 or less deletes the matching cookie and does not store a new one.
         if expired {
             self.cookies
                 .retain(|c| !(c.name == name && c.domain == domain && c.path == path));
@@ -421,6 +544,7 @@ impl CookieJar {
             .iter_mut()
             .find(|c| c.name == name && c.domain == domain && c.path == path)
         {
+            // A Secure cookie cannot be overwritten from a non-https response.
             if existing.secure && !is_https {
                 return false;
             }
@@ -432,6 +556,7 @@ impl CookieJar {
             return true;
         }
 
+        // Drop the oldest cookie for this domain, then the oldest cookie in the jar.
         let host_count = self.cookies.iter().filter(|c| c.domain == domain).count();
         if host_count >= MAX_COOKIES_PER_HOST {
             if let Some(pos) = self.cookies.iter().position(|c| c.domain == domain) {
@@ -455,9 +580,14 @@ impl CookieJar {
         true
     }
 
-    /// Format the outgoing `Cookie` HTTP header for `target_url` initiated from `initiator_url`.
-    /// Includes `HttpOnly` cookies (since this is for the network layer) while enforcing
-    /// `Secure`, `Domain`, `Path`, and `SameSite` rules.
+    /// `Cookie` header value for `target_url`, including `HttpOnly` cookies.
+    ///
+    /// `None` when the URL does not parse or no cookie matches. `Secure` cookies
+    /// are omitted on non-`https` targets. Host-only cookies require an exact host.
+    /// Domain cookies match the host exactly or as a dotted suffix. The path must match. `SameSite=Strict`
+    /// is omitted when the initiator is cross-site. `SameSite=Lax` is omitted on a
+    /// cross-site request that is not a top-level GET. `SameSite=None` is omitted
+    /// unless the target is `https`. A missing initiator is treated as same-site.
     pub fn http_cookie_header(
         &self,
         target_url: &str,
@@ -467,13 +597,19 @@ impl CookieJar {
         self.matching_cookie_string(target_url, initiator_url, is_top_level_get, true)
     }
 
-    /// Format the script-visible `document.cookie` string for `page_url`.
-    /// Strictly excludes all `HttpOnly` cookies.
+    /// Script-visible cookie string for `page_url`.
+    ///
+    /// `HttpOnly` cookies are omitted. The initiator is the page itself and the
+    /// request is treated as a top-level GET, so `SameSite` does not hide cookies
+    /// here. An unparseable URL or no match yields an empty string, not `None`.
     pub fn script_cookie_string(&self, page_url: &str) -> String {
         self.matching_cookie_string(page_url, Some(page_url), true, false)
             .unwrap_or_default()
     }
 
+    /// Join matching `name=value` pairs with `"; "`.
+    ///
+    /// `include_http_only` is true for the HTTP header and false for script access.
     fn matching_cookie_string(
         &self,
         target_url: &str,
@@ -508,6 +644,8 @@ impl CookieJar {
             if !path_matches(&target.path, &cookie.path) {
                 continue;
             }
+            // Strict never leaves the site. Lax leaves only on a top-level GET.
+            // None is sent only to https. A missing initiator counts as same-site.
             match cookie.same_site {
                 SameSite::Strict if !same_site_req => continue,
                 SameSite::Lax if !same_site_req && !is_top_level_get => continue,
@@ -524,7 +662,7 @@ impl CookieJar {
         }
     }
 
-    /// Serialize the Cookie Jar into a `flux_json` string.
+    /// Serialize every stored cookie. Flags are written as stored. No re-check.
     pub fn to_json(&self) -> String {
         let mut root = JsonValue::empty_object();
         let mut list = JsonValue::empty_array();
@@ -547,7 +685,12 @@ impl CookieJar {
         to_json_string(&root)
     }
 
-    /// Deserialize a `CookieJar` from bounded JSON.
+    /// Restore a jar from JSON produced by [`Self::to_json`].
+    ///
+    /// The document is capped at depth 16 and 1 MiB. Entries beyond
+    /// [`MAX_COOKIES_TOTAL`] are ignored. A missing name, value, or domain skips
+    /// that entry. Prefix, `Secure`, and `SameSite` rules are not applied again.
+    /// A missing `same_site` becomes [`SameSite::Lax`]. A missing path becomes `/`.
     pub fn from_json(source: &str) -> Result<Self, String> {
         let doc = parse_json_bounded(source, 16, 1024 * 1024).map_err(|e| e.to_string())?;
         let items = doc.get_array("cookies").ok_or("missing cookies array")?;
@@ -585,12 +728,20 @@ impl CookieJar {
     }
 }
 
+/// Host equals the cookie domain, or ends with `.{cookie_domain}`.
+///
+/// Comparison is ASCII case-insensitive. This does not reject a domain that
+/// is a public suffix. Callers that store cookies also require a dot in the domain.
 fn domain_matches(host: &str, cookie_domain: &str) -> bool {
     let host_low = host.to_ascii_lowercase();
     let dom_low = cookie_domain.to_ascii_lowercase();
     host_low == dom_low || host_low.ends_with(&format!(".{dom_low}"))
 }
 
+/// Request path equals the cookie path, or extends it on a `/` boundary.
+///
+/// A cookie path of `/docs` matches `/docs` and `/docs/a`, not `/docs2`.
+/// A cookie path that already ends in `/` matches any longer path with that prefix.
 fn path_matches(req_path: &str, cookie_path: &str) -> bool {
     if req_path == cookie_path {
         return true;
@@ -601,9 +752,15 @@ fn path_matches(req_path: &str, cookie_path: &str) -> bool {
     false
 }
 
-/// Maximum number of learned HSTS host entries retained in [`HstsStore`].
+/// Maximum learned HSTS hosts in [`HstsStore`].
+///
+/// The preload list does not count toward this cap. A new host past the cap
+/// drops the oldest learned entry. `max-age=0` removes one learned host and
+/// does not remove a preloaded host.
 pub const MAX_HSTS_HOSTS: usize = 512;
 
+/// Hosts that [`HstsStore::requires_https`] always treats as HSTS, including subdomains.
+/// These entries are not written by [`HstsStore::to_json`].
 const PRELOADED_HSTS_DOMAINS: &[&str] = &[
     "github.com",
     "githubusercontent.com",
@@ -614,48 +771,69 @@ const PRELOADED_HSTS_DOMAINS: &[&str] = &[
     "proton.me",
 ];
 
+/// One learned HSTS host. Not used for the preload list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HstsEntry {
+    /// Lowercased host the policy was learned for. Not a wildcard.
     pub host: String,
+    /// When true, hosts ending in `.{host}` also require HTTPS.
     pub include_subdomains: bool,
+    /// Stored `max-age` in seconds. Not compared to a clock.
     pub max_age: u64,
 }
 
-/// RFC 6797 HTTP Strict-Transport-Security (`HSTS`) policy store with built-in preload domains.
+/// Learned HSTS policies plus the built-in preload list.
+///
+/// A `Strict-Transport-Security` header is stored only when the request URL is
+/// `https`. `max-age` is required and is stored as a number. It is not compared
+/// to a clock, so a positive age does not expire. `includeSubDomains` applies
+/// only to learned entries. Preload hosts always include subdomains.
+/// [`Self::upgrade_url_if_hsts`] rewrites `http://` to `https://` only when the
+/// parsed port is 80.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HstsStore {
     entries: Vec<HstsEntry>,
 }
 
 impl HstsStore {
+    /// Empty learned list. Preload still applies in [`Self::requires_https`].
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
     }
 
+    /// Number of learned hosts. Preload hosts are not included.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no learned hosts are stored. Preload can still force HTTPS.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Drop learned hosts. Preload remains in effect.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
+    /// Learned hosts in insertion order.
     pub fn entries(&self) -> &[HstsEntry] {
         &self.entries
     }
 
-    /// Parse and record a `Strict-Transport-Security` header received over an `https://` connection.
+    /// Store a `Strict-Transport-Security` header from `request_url`.
+    ///
+    /// Returns `false` when the URL does not parse, the scheme is not `https`,
+    /// or `max-age` is missing or not a `u64`. A header on `http` is ignored.
+    /// `max-age=0` deletes the learned host and returns `true`. Unknown directives
+    /// are ignored. `includeSubDomains` is recognized only as a flag token.
     pub fn record_hsts_header(&mut self, request_url: &str, header_value: &str) -> bool {
         let Ok(parsed) = parse_url(request_url) else {
             return false;
         };
-        // RFC 6797 Section 8.1: HSTS headers over insecure HTTP must be ignored
+        // An HSTS header received over http is ignored and does not change the store.
         if parsed.scheme != "https" {
             return false;
         }
@@ -683,6 +861,7 @@ impl HstsStore {
             return false;
         };
         let host = parsed.host.to_ascii_lowercase();
+        // max-age=0 removes the learned host only. It does not remove a preload match.
         if age == 0 {
             self.entries.retain(|e| e.host != host);
             return true;
@@ -694,6 +873,7 @@ impl HstsStore {
             return true;
         }
 
+        // Cap learned hosts. The oldest learned entry is dropped.
         if self.entries.len() >= MAX_HSTS_HOSTS {
             self.entries.remove(0);
         }
@@ -705,7 +885,11 @@ impl HstsStore {
         true
     }
 
-    /// Check whether `host` requires HTTPS via the built-in preload list or a learned HSTS policy.
+    /// Whether `host` must use HTTPS.
+    ///
+    /// True when the host equals a preload domain or ends with `.{preload}`,
+    /// equals a learned host, or ends with `.{learned}` and that entry set
+    /// `includeSubDomains`. An empty host is false. `max-age` is not consulted.
     pub fn requires_https(&self, host: &str) -> bool {
         let clean = host.trim().to_ascii_lowercase();
         if clean.is_empty() {
@@ -727,7 +911,11 @@ impl HstsStore {
         false
     }
 
-    /// Automatically rewrite `http://` URLs to `https://` when the target host matches an HSTS policy.
+    /// Rewrite an `http://` URL to `https://` when the host is HSTS and the port is 80.
+    ///
+    /// Any other scheme is returned trimmed and unchanged. An `http` URL that does
+    /// not parse is unchanged. An HSTS host on a port other than 80 is unchanged,
+    /// so a non-default port is not upgraded.
     pub fn upgrade_url_if_hsts(&self, url: &str) -> String {
         let trimmed = url.trim();
         let Some(rest) = trimmed.strip_prefix("http://") else {
@@ -737,6 +925,7 @@ impl HstsStore {
             return trimmed.to_string();
         };
         if self.requires_https(&parsed.host) {
+            // Only the default http port is rewritten. The rest of the URL is kept.
             if parsed.port == 80 {
                 format!("https://{rest}")
             } else {
@@ -747,6 +936,7 @@ impl HstsStore {
         }
     }
 
+    /// Serialize learned hosts. The preload list is not included.
     pub fn to_json(&self) -> String {
         let mut root = JsonValue::empty_object();
         let mut list = JsonValue::empty_array();
@@ -764,6 +954,12 @@ impl HstsStore {
         to_json_string(&root)
     }
 
+    /// Restore learned hosts from JSON produced by [`Self::to_json`].
+    ///
+    /// Depth cap 16 and 1 MiB. Entries past [`MAX_HSTS_HOSTS`] are ignored.
+    /// A missing host skips the entry. A missing `max_age` becomes 31536000.
+    /// A non-positive `max_age` becomes 1, so this path does not delete hosts.
+    /// Preload is applied later by [`Self::requires_https`], not from this JSON.
     pub fn from_json(source: &str) -> Result<Self, String> {
         let doc = parse_json_bounded(source, 16, 1024 * 1024).map_err(|e| e.to_string())?;
         let items = doc.get_array("hsts").ok_or("missing hsts array")?;
@@ -784,6 +980,7 @@ impl HstsStore {
     }
 }
 
+/// FIPS 180-4 SHA-256 round constants.
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
     0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -795,7 +992,11 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-/// Compute a FIPS 180-4 SHA-256 digest over `data`.
+/// SHA-256 over `data`.
+///
+/// Pads with `0x80`, then zeros until the length modulo 64 is 56, then the
+/// bit length as a big-endian `u64`. The bit length wraps on overflow of that
+/// multiply. Always returns 32 bytes. There is no failure value.
 pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     let mut state: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -873,14 +1074,18 @@ pub fn sha256_digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Compute a W3C Subresource Integrity (`SRI`) `sha256-<base64>` token for `payload`.
+/// `sha256-` plus standard base64 of [`sha256_digest`], with `=` padding.
 pub fn sri_sha256_token(payload: &[u8]) -> String {
     let digest = sha256_digest(payload);
     format!("sha256-{}", base64_encode(&digest))
 }
 
-/// Verify a W3C Subresource Integrity (`integrity="sha256-..."`) attribute against `payload`.
-/// Returns `true` if `integrity_attr` is `None`/empty, or if at least one `sha256-` digest matches.
+/// Check an `integrity` attribute against `payload`.
+///
+/// `None` and an empty or whitespace-only attribute allow the payload, because
+/// no digest was required. When the attribute is present, only tokens that
+/// start with `sha256-` are compared. Other algorithms are ignored. If no
+/// `sha256-` token is present, the check fails. One matching token is enough.
 pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]) -> bool {
     let Some(raw) = integrity_attr else {
         return true;
@@ -893,6 +1098,7 @@ pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]
         .split_whitespace()
         .filter(|tok| tok.starts_with("sha256-"))
         .collect();
+    // An integrity value with no sha256 token does not pass.
     if sha256_tokens.is_empty() {
         return false;
     }
@@ -900,6 +1106,8 @@ pub fn verify_subresource_integrity(integrity_attr: Option<&str>, payload: &[u8]
     sha256_tokens.contains(&expected.as_str())
 }
 
+/// Standard base64 with `=` padding. The alphabet is not URL-safe.
+/// Used only to build SRI tokens.
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

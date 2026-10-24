@@ -1,10 +1,17 @@
-// Flux Browser Download Manager & SHA-256 Quarantine Dashboard Component (flux://downloads)
+// Stored text for flux://downloads. frontend.rs downloads_html_with_entries
+// compiles it. Only the markup block is kept. There is no script file.
+// Props filled by the compiler: version, entryCount.
+// The DOWNLOAD_ITEMS_SLOT marker in the markup is replaced with one block
+// per download, or the empty-state sentence.
+// Lines above the markup block are not copied into the page.
 // Author: Buntos
 
 export interface DownloadsPageProps {
-  version: string;
-  entryCount: string;
+  version: string; // Shown in the badge line.
+  entryCount: string; // File count, already formatted.
 }
+
+// Markup below is extracted. Do not put page-visible notes in that block.
 
 export function DownloadsPage(props: DownloadsPageProps) {
   return (

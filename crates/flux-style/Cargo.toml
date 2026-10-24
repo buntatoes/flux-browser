@@ -1,3 +1,7 @@
+# CSS parser and cascade. Reads flux-dom nodes. Does not place boxes.
+# flux-layout reads the computed style. flux-raster also reads style values
+# that the display list did not fully flatten.
+
 [package]
 name = "flux-style"
 description = "CSS cascade and media queries."

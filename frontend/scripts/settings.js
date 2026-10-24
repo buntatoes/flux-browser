@@ -1,4 +1,5 @@
-// Flux Browser Two-Column Settings Controller (flux://settings)
+// Stored script text for flux://settings. frontend.rs copies this file into
+// a script element after flux_core.js.
 // Author: Buntos
 
 function switchSettingsSection(sectionName) {
@@ -11,9 +12,40 @@ function switchSettingsSection(sectionName) {
       card.style.display = 'none';
     }
   });
+  writeFluxPref('flux.settings.section', sectionName);
+  let navIds = [
+    'nav-sec-all',
+    'nav-sec-search',
+    'nav-sec-js',
+    'nav-sec-privacy',
+    'nav-sec-system'
+  ];
+  let targetNavId = 'nav-sec-all';
+  if (sectionName === 'search') {
+    targetNavId = 'nav-sec-search';
+  } else if (sectionName === 'js') {
+    targetNavId = 'nav-sec-js';
+  } else if (sectionName === 'privacy') {
+    targetNavId = 'nav-sec-privacy';
+  } else if (sectionName === 'system') {
+    targetNavId = 'nav-sec-system';
+  }
+  highlightActiveNavItem(targetNavId, navIds);
+}
+
+function restoreInitialSettingsSection() {
+  let href = window.location.href;
+  let querySec = parseFluxQueryParam(href, 'section');
+  if (querySec !== '') {
+    switchSettingsSection(querySec);
+    return querySec;
+  }
+  return 'all';
 }
 
 function initFluxSettings() {
+  recordFluxPageVisit('settings');
+
   let navAll = document.getElementById('nav-sec-all');
   let navSearch = document.getElementById('nav-sec-search');
   let navPrivacy = document.getElementById('nav-sec-privacy');
@@ -45,6 +77,8 @@ function initFluxSettings() {
       switchSettingsSection('system');
     });
   }
+
+  restoreInitialSettingsSection();
 }
 
 initFluxSettings();

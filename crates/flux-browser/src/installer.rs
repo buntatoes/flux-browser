@@ -1,12 +1,20 @@
-//! Cross-platform native installer and uninstaller for Windows and Linux.
+//! Install and uninstall helpers.
 //!
-//! - **Windows**: Installs `flux.exe` (and bundled `examples/` if present) into
-//!   `%LOCALAPPDATA%\Programs\Flux Browser`, creates Start Menu and Desktop
-//!   shortcuts (`Flux Browser.lnk`), and registers the per-user uninstaller key
-//!   under `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FluxBrowser`.
-//! - **Linux**: Installs `flux` into `~/.local/share/flux-browser/flux` and
-//!   `~/.local/bin/flux`, and writes an XDG desktop entry to
-//!   `~/.local/share/applications/flux-browser.desktop`.
+//! `src/main.rs` calls `install_default` and `uninstall_default` for the
+//! `install` and `uninstall` commands. `src/bin/flux-setup.rs` calls the same
+//! functions, plus `pack_sfx_installer` for `--pack`.
+//!
+//! The self-extracting trailer is zlib from `flux-compress`: setup stub, compressed
+//! browser bytes, a little-endian length, then `FLUXSFX1`. Icons written into the
+//! install directory come from `logo`. This module does not download files and it
+//! does not show message boxes. Those prompts live in `flux-setup`.
+//!
+//! Windows copies `flux.exe` under `LOCALAPPDATA\Programs\Flux Browser` (or
+//! `USERPROFILE\AppData\Local\Programs\Flux Browser`), writes Start Menu and
+//! Desktop shortcuts named `Flux Browser.lnk`, and adds
+//! `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FluxBrowser`.
+//! Linux copies `flux` under `HOME/.local/share/flux-browser`, copies it again to
+//! `HOME/.local/bin/flux`, and writes `HOME/.local/share/applications/flux-browser.desktop`.
 
 use std::env;
 use std::fs;
@@ -24,8 +32,11 @@ pub const SFX_MAGIC: &[u8; 8] = b"FLUXSFX1";
 /// Maximum decompressed size of an embedded `flux.exe` binary payload (32 MiB).
 pub const MAX_SFX_BINARY_BYTES: usize = 32 * 1024 * 1024;
 
+/// Sample page copied into `examples/hello.html` in the install directory.
 const EXAMPLE_HELLO_HTML: &str = include_str!("../../../examples/hello.html");
+/// Sample page copied into `examples/second.html` in the install directory.
 const EXAMPLE_SECOND_HTML: &str = include_str!("../../../examples/second.html");
+/// Sample stylesheet copied into `examples/theme.css` in the install directory.
 const EXAMPLE_THEME_CSS: &str = include_str!("../../../examples/theme.css");
 
 /// Combine a compiled `flux-setup` stub executable and a compiled `flux` browser executable
@@ -80,12 +91,18 @@ pub fn strip_sfx_trailer(installer_bytes: &[u8]) -> &[u8] {
     installer_bytes
 }
 
+/// Paths and flags recorded by one call to `install_to_dir`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallReport {
+    /// Directory that received the browser binary.
     pub install_dir: PathBuf,
+    /// Path of the installed `flux` or `flux.exe`.
     pub installed_binary: PathBuf,
+    /// Path of `Installer/setup.exe` or `Installer/flux-setup`.
     pub uninstaller_binary: PathBuf,
+    /// Shortcut or desktop-file paths that were created. Empty when integration is off or failed.
     pub shortcut_paths: Vec<PathBuf>,
+    /// True when the Windows registry key or the Linux desktop file was written.
     pub registered_os_entry: bool,
 }
 
@@ -127,8 +144,12 @@ pub fn uninstall_default() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Install the current Flux binary into `install_dir`.
-/// When `integrate_os` is `true`, also creates desktop/menu shortcuts and OS uninstall metadata.
+/// Install the current binary into `install_dir`.
+///
+/// Writes `flux-logo.ico`, `flux-logo.png`, and the three embedded example files.
+/// If a local `examples` directory exists, its top-level files are copied over those.
+/// When `integrate_os` is true, Windows shortcuts and the uninstall registry key are
+/// created, or the Linux desktop entry and `HOME/.local/bin/flux` copy are created.
 pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallReport, String> {
     fs::create_dir_all(install_dir)
         .map_err(|e| format!("could not create {}: {e}", install_dir.display()))?;
@@ -146,7 +167,8 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
     let installed_binary = install_dir.join(bin_name);
     let uninstaller_binary = installer_subdir.join(setup_sub_name);
 
-    // 1. Check if the running executable embeds a compressed FLUXSFX1 browser payload
+    // If this executable has a FLUXSFX1 trailer, write the decompressed browser
+    // as the installed binary and the stripped stub as Installer/setup.exe.
     let mut wrote_embedded = false;
     if let Ok(self_bytes) = fs::read(&current_exe) {
         if let Some(browser_bytes) = extract_sfx_payload(&self_bytes)? {
@@ -162,7 +184,8 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
         }
     }
 
-    // 2. Otherwise copy sibling `flux.exe` (or current executable) into `install_dir`
+    // No trailer: copy a sibling browser binary, or this executable if none exists.
+    // The uninstaller copy prefers a sibling `flux-setup` binary, else this executable.
     if !wrote_embedded {
         let sibling_flux = current_exe.parent().map(|p| p.join(bin_name));
         let source_bin = match sibling_flux {
@@ -271,6 +294,7 @@ pub fn uninstall_from_dir(install_dir: &Path, integrate_os: bool) -> Result<(), 
     Ok(())
 }
 
+/// Copy files that sit directly in `src` onto `dst`. Nested directories are skipped.
 fn copy_dir_flat(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -285,6 +309,9 @@ fn copy_dir_flat(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Create `Flux Browser.lnk` on the Desktop and in the Start Menu Programs folder.
+///
+/// The script runs `powershell` with `WScript.Shell`. Failures return an empty list.
 fn create_windows_shortcuts(
     exe_path: &Path,
     ico_path: &Path,
@@ -339,6 +366,10 @@ fn create_windows_shortcuts(
     Ok(created)
 }
 
+/// Delete the Start Menu and Desktop shortcut files this installer creates.
+///
+/// Also deletes a legacy `Uninstall Flux Browser.lnk` if that file is present.
+/// Missing files are ignored.
 fn remove_windows_shortcuts() {
     if let Some(appdata) = env::var_os("APPDATA") {
         let start_programs = PathBuf::from(appdata)
@@ -361,6 +392,9 @@ fn remove_windows_shortcuts() {
     }
 }
 
+/// Write the per-user uninstall registry values with `reg add`.
+///
+/// The quiet uninstall command is the uninstaller path plus `--uninstall --silent`.
 fn register_windows_uninstaller(
     uninstaller_path: &Path,
     ico_path: &Path,
@@ -401,6 +435,7 @@ fn register_windows_uninstaller(
     Ok(())
 }
 
+/// Run `reg delete` on the uninstall key. A failed delete is ignored.
 fn unregister_windows_uninstaller() -> Result<(), String> {
     let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\FluxBrowser";
     let mut cmd = Command::new("reg");
@@ -414,6 +449,8 @@ fn unregister_windows_uninstaller() -> Result<(), String> {
     Ok(())
 }
 
+/// Copy the binary to `HOME/.local/bin/flux`, copy the PNG into the hicolor icon
+/// theme, and write `flux-browser.desktop`.
 fn install_linux_desktop_integration(
     exe_path: &Path,
     png_path: &Path,
@@ -470,6 +507,7 @@ fn install_linux_desktop_integration(
     Ok(created)
 }
 
+/// Remove `HOME/.local/bin/flux` and the desktop file. The copied icon is left in place.
 fn remove_linux_desktop_integration() {
     if let Some(home) = env::var_os("HOME") {
         let home_dir = PathBuf::from(home);
@@ -484,15 +522,18 @@ fn remove_linux_desktop_integration() {
     }
 }
 
+/// Double single quotes so a path can sit inside a PowerShell single-quoted string.
 fn escape_ps(input: &str) -> String {
     input.replace('\'', "''")
 }
 
 #[cfg(test)]
 mod tests {
+    //! Installs into a temporary directory with OS integration off, then checks the SFX trailer.
     use super::*;
 
     #[test]
+    /// Install into a temp directory with OS integration off, remove it, and round-trip an SFX trailer.
     fn stages_and_removes_portable_installation_directory() {
         let staging = env::temp_dir().join(format!("flux_installer_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&staging);

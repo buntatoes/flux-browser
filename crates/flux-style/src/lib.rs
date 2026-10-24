@@ -1,13 +1,37 @@
 //! Style sheets, selector matching, and the cascade.
+//!
+//! Second stage of the pipeline. flux-dom has already built the node list.
+//! This crate borrows that [`flux_dom::Document`], parses CSS into an owned [`Stylesheet`],
+//! and writes one [`ComputedStyle`] per reachable node. flux-layout reads the
+//! [`StyleMap`] and places boxes. This crate does not lay out or paint.
+//!
+//! Lengths are `px` or `0`. Anything else is skipped, or becomes [`Size::Auto`].
+//! There is no grid, no `var(--token)`, no percentages, and no `em` / `rem`.
+//! `display` accepts `block`, `inline`, `flex`, and `none`. A descendant
+//! selector is whitespace between compounds. `>`, `+`, `~`, attribute
+//! selectors, and pseudo-classes are not parsed.
+//!
+//! `@media` reads `min-width`, `max-width`, and `prefers-color-scheme`.
+//! Only `dark` matches a color scheme; `light` and any other value do not.
+//! An inner `@media` replaces the outer query instead of combining with it.
+//! Other at-rules are skipped. The cascade is user-agent defaults, then author
+//! rules by specificity `(ids, classes, types)` and source order, then the
+//! `style` attribute, which always wins.
 
 use flux_dom::{Document, NodeData, NodeId};
 
-/// A parsed style sheet.
+/// A parsed style sheet. Rules are owned, in source order, including rules
+/// that came from inside `@media`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
 }
 
+/// Viewport tests attached to a rule. Absent fields are unconstrained.
+///
+/// `color_scheme` is owned lowercase text from the query. Widths are CSS
+/// pixels rounded from the parsed number. A query with no recognized tests
+/// matches every viewport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MediaQuery {
     pub min_width_px: Option<u32>,
@@ -16,6 +40,11 @@ pub struct MediaQuery {
 }
 
 impl MediaQuery {
+    /// Parse parenthesized features out of an `@media` condition.
+    ///
+    /// `cond` is borrowed. The result owns any color-scheme string. Unknown
+    /// features are ignored. A condition with no closing `)` stops at the
+    /// broken parenthesis. Width values may include a `px` suffix.
     pub fn parse(cond: &str) -> Self {
         let mut mq = Self::default();
         let lower = cond.to_ascii_lowercase();
@@ -47,6 +76,11 @@ impl MediaQuery {
         mq
     }
 
+    /// True when `viewport_width` is inside the min and max, and the color
+    /// scheme is unset or `dark`.
+    ///
+    /// Width is rounded to a `u32` after clamping at 0. Any other color scheme,
+    /// including `light`, returns false. The query is borrowed.
     pub fn matches(&self, viewport_width: f32) -> bool {
         let vw = viewport_width.max(0.0).round() as u32;
         if let Some(min_w) = self.min_width_px {
@@ -68,6 +102,8 @@ impl MediaQuery {
     }
 }
 
+/// One style rule. Selectors and declarations are owned.
+/// `media` is `None` when the rule was not inside `@media`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rule {
     pub selectors: Vec<Selector>,
@@ -75,6 +111,10 @@ pub struct Rule {
     pub media: Option<MediaQuery>,
 }
 
+/// One compound in a selector chain: optional tag, id, and classes.
+///
+/// `universal` is `*` with no tag, id, or class. Identifiers are owned.
+/// An empty compound matches nothing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompoundSelector {
     pub universal: bool,
@@ -84,10 +124,15 @@ pub struct CompoundSelector {
 }
 
 impl CompoundSelector {
+    /// True when the compound has no universal flag, tag, id, or class.
     fn is_empty(&self) -> bool {
         !self.universal && self.tag.is_none() && self.id.is_none() && self.classes.is_empty()
     }
 
+    /// True when `node_id` is an element and every tag, id, and class matches.
+    ///
+    /// `doc` is borrowed. Text and the document node never match. A universal
+    /// compound with no other tests matches every element.
     fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
         let data = doc.get(node_id).data();
         let Some(actual_tag) = data.tag() else {
@@ -111,6 +156,8 @@ impl CompoundSelector {
         true
     }
 
+    /// Specificity as `(ids, classes, types)`. A tag contributes one type.
+    /// The universal flag contributes nothing. The class count is cast to `u16`.
     fn specificity(&self) -> (u16, u16, u16) {
         let ids = u16::from(self.id.is_some());
         let classes = self.classes.len() as u16;
@@ -119,12 +166,17 @@ impl CompoundSelector {
     }
 }
 
+/// A selector chain. The last compound is the subject. Earlier compounds
+/// must match some ancestor, in order, not necessarily the parent.
+/// `chain` is owned. An empty chain matches nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selector {
     pub chain: Vec<CompoundSelector>,
 }
 
 impl Selector {
+    /// True when `node_id` matches the subject and each earlier compound
+    /// matches an ancestor. `doc` is borrowed. An empty chain is false.
     pub fn matches(&self, doc: &Document, node_id: NodeId) -> bool {
         let Some((last, ancestors)) = self.chain.split_last() else {
             return false;
@@ -150,6 +202,7 @@ impl Selector {
         true
     }
 
+    /// Sum of each compound's `(ids, classes, types)`.
     pub fn specificity(&self) -> (u16, u16, u16) {
         self.chain.iter().fold((0, 0, 0), |(i, c, t), part| {
             let (pi, pc, pt) = part.specificity();
@@ -158,12 +211,15 @@ impl Selector {
     }
 }
 
+/// One CSS declaration. `name` is owned and lowercase. `value` is owned
+/// and still unparsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Declaration {
     pub name: String,
     pub value: String,
 }
 
+/// sRGB color. Channels are 0–255. `a` is 255 when the source omitted alpha.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -173,6 +229,7 @@ pub struct Color {
 }
 
 impl Color {
+    /// Opaque black.
     pub const BLACK: Self = Self {
         r: 0,
         g: 0,
@@ -180,6 +237,7 @@ impl Color {
         a: 255,
     };
 
+    /// Opaque white.
     pub const WHITE: Self = Self {
         r: 255,
         g: 255,
@@ -187,6 +245,13 @@ impl Color {
         a: 255,
     };
 
+    /// Parse `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`, or a
+    /// named color: black, white, red, green, blue, gray, grey, silver, yellow,
+    /// orange, transparent.
+    ///
+    /// `value` is borrowed. `None` if the text is not one of those forms.
+    /// `rgba` alpha with a decimal point and a value of at most 1 is a fraction
+    /// of 255. Any other alpha is a 0–255 channel.
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
         if let Some(hex) = value.strip_prefix('#') {
@@ -262,61 +327,95 @@ impl Color {
         })
     }
 
+    /// Owned `#rrggbb`. Alpha is omitted.
     pub fn hex(self) -> String {
         format!("#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
     }
 }
 
+/// `display` as stored after the cascade. Unknown values are left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Display {
+    /// Participate in a line. This is the initial value.
     Inline,
+    /// A block box.
     Block,
+    /// A flex container. The items are the element's children.
     Flex,
+    /// The element and its descendants generate no box.
     None,
 }
 
+/// Main axis of a flex container. The initial value is [`Self::Row`].
+/// `row-reverse` and `column-reverse` are not recognized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlexDirection {
+    /// Lay items out in a single horizontal line. Items do not wrap.
     Row,
+    /// Lay items out in a single vertical line.
     Column,
 }
 
+/// Main-axis packing for a flex line. Only one line is laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JustifyContent {
+    /// Pack against the start. `flex-start` and `start` both map here.
     Start,
+    /// Center the free space before and after the items.
     Center,
+    /// Pack against the end. `flex-end` and `end` both map here.
     End,
+    /// First item at the start, last at the end, equal gaps between.
+    /// A single item is placed at the start.
     SpaceBetween,
 }
 
+/// Cross-axis alignment for flex items. Column flex ignores this value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlignItems {
+    /// Align to the cross start. `flex-start` and `start` both map here.
     Start,
+    /// Center on the cross axis.
     Center,
+    /// Align to the cross end. `flex-end` and `end` both map here.
     End,
+    /// Stretch items whose height is `auto` to the line's cross size.
+    /// This is the initial value. Width is not stretched.
     Stretch,
 }
 
+/// `position` as stored for flux-layout. Unknown values are left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Position {
+    /// In flow. Offsets are ignored. This is the initial value.
     Static,
+    /// In flow, then shifted by `top`/`left` (or `bottom`/`right`).
     Relative,
+    /// Out of flow. The containing block is the parent's border box.
     Absolute,
+    /// Out of flow. Laid out against the origin, not a separate viewport.
     Fixed,
 }
 
+/// `overflow` as stored for layout and paint. `scroll` and `auto` become [`Self::Hidden`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Overflow {
+    /// Descendants may paint outside the box. This is the initial value.
     Visible,
+    /// Clip descendants to the padding edge. Also used for `scroll` and `auto`.
     Hidden,
 }
 
+/// A used length. Percentages and other units are not represented; they parse as [`Self::Auto`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size {
+    /// The layout stage chooses the size.
     Auto,
+    /// A CSS pixel length. Zero is allowed. Negative values are not rejected here.
     Px(f32),
 }
 
+/// Four CSS pixel edges, clockwise from the top. Not a percentage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Edge {
     pub top: f32,
@@ -326,6 +425,7 @@ pub struct Edge {
 }
 
 impl Edge {
+    /// All four edges zero.
     pub const fn zero() -> Self {
         Self {
             top: 0.0,
@@ -335,6 +435,7 @@ impl Edge {
         }
     }
 
+    /// The same pixel length on every edge.
     pub const fn all(value: f32) -> Self {
         Self {
             top: value,
@@ -345,6 +446,9 @@ impl Edge {
     }
 }
 
+/// One `box-shadow` layer. Offsets are CSS pixels, y downward (positive `offset_y`
+/// moves the shadow down). Blur is floored at 0 when parsed. The default color,
+/// if the declaration omits one, is black at alpha 128. Inset shadows are not parsed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoxShadow {
     pub offset_x: f32,
@@ -354,6 +458,8 @@ pub struct BoxShadow {
     pub color: Color,
 }
 
+/// A two-stop `linear-gradient`. `angle_deg` follows CSS: 0 is upward, 90 is
+/// to the right. Extra color stops are dropped; only the first and last are kept.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinearGradient {
     pub angle_deg: f32,
@@ -361,6 +467,16 @@ pub struct LinearGradient {
     pub end_color: Color,
 }
 
+/// Used values for one element after the user-agent defaults, the cascade,
+/// and the inline `style` attribute.
+///
+/// Lengths are CSS pixels. `background` is `None` when no solid color was set.
+/// `background_gradient` is independent and, when set, also stores its first
+/// stop in `background`. `box_shadow` is `None` when unset or `none`.
+/// Inherited on elements: `color`, `font_size`, and `underline`. A child's
+/// `border_color` starts as the inherited `color`, not the parent's border color.
+/// Text nodes keep the parent style unchanged. This value does not include
+/// a used position; flux-layout resolves `auto` sizes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ComputedStyle {
     pub display: Display,
@@ -392,6 +508,9 @@ pub struct ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// Initial values: inline, static, visible, black text, 16px, no margin,
+    /// padding, border, or background, row flex, start justification, stretch
+    /// alignment, and zero gap.
     pub const fn initial() -> Self {
         Self {
             display: Display::Inline,
@@ -423,6 +542,8 @@ impl ComputedStyle {
         }
     }
 
+    /// Style a child element starts from. Copies `color`, `font_size`, and
+    /// `underline`, sets `border_color` to that color, and resets everything else.
     fn inherited_child(self) -> Self {
         Self {
             color: self.color,
@@ -434,12 +555,16 @@ impl ComputedStyle {
     }
 }
 
+/// Computed styles indexed by [`NodeId`]. The vector is owned.
+/// Slots that the walk never wrote stay at [`ComputedStyle::initial`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleMap {
     styles: Vec<ComputedStyle>,
 }
 
 impl StyleMap {
+    /// Borrow the style for `id`. An id past the map returns a static initial
+    /// style, not an error. The reference lives as long as `self`.
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         self.styles.get(id.index()).unwrap_or(&FALLBACK)
     }
@@ -447,6 +572,11 @@ impl StyleMap {
 
 const FALLBACK: ComputedStyle = ComputedStyle::initial();
 
+/// Parse `input` into an owned style sheet.
+///
+/// Comments (`/* */`) are replaced with a space. Rules inside `@media` keep
+/// that query. An inner `@media` does not combine with the outer one. At-rules
+/// other than `@media` are skipped. The input is borrowed.
 pub fn parse_css(input: &str) -> Stylesheet {
     let input = strip_comments(input);
     let mut rules = Vec::new();
@@ -454,6 +584,10 @@ pub fn parse_css(input: &str) -> Stylesheet {
     Stylesheet { rules }
 }
 
+/// Index of the `}` that closes a body whose opening `{` was already consumed.
+///
+/// Nested braces are counted. If the body never closes, the length is returned
+/// and the caller treats the rest as the body.
 fn find_matching_brace(src: &str) -> usize {
     let mut depth = 1usize;
     for (idx, ch) in src.char_indices() {
@@ -471,6 +605,11 @@ fn find_matching_brace(src: &str) -> usize {
     src.len()
 }
 
+/// Split `rest` into rules, appending to `rules`.
+///
+/// `active_media` is cloned onto each rule. `@media` replaces it for the
+/// nested body instead of intersecting the two queries. A prelude that starts
+/// with `@` and is not `@media` is dropped, body included.
 fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut Vec<Rule>) {
     while let Some(open) = rest.find('{') {
         let selector_src = rest[..open].trim();
@@ -502,10 +641,21 @@ fn parse_css_rules(mut rest: &str, active_media: Option<MediaQuery>, rules: &mut
     }
 }
 
+/// Cascade `sheet` onto `doc` at a viewport width of 960 CSS pixels.
+///
+/// Both inputs are borrowed. The returned map is owned. Equivalent to
+/// [`compute_styles_with_viewport`] with `960.0`.
 pub fn compute_styles(doc: &Document, sheet: &Stylesheet) -> StyleMap {
     compute_styles_with_viewport(doc, sheet, 960.0)
 }
 
+/// Cascade `sheet` onto `doc` for `viewport_width` in CSS pixels.
+///
+/// `doc` and `sheet` are borrowed. The map is sized to one past the highest
+/// reachable node index, not to [`flux_dom::Document::node_count`],
+/// so detached high indexes that are unreachable do not extend it. `@media`
+/// rules that fail their width tests are skipped. `prefers-color-scheme: dark`
+/// passes with no width test of its own; `light` never passes.
 pub fn compute_styles_with_viewport(
     doc: &Document,
     sheet: &Stylesheet,
@@ -523,6 +673,8 @@ pub fn compute_styles_with_viewport(
     StyleMap { styles }
 }
 
+/// One past the largest node index reachable from the root.
+/// Unreachable detached nodes do not count. `doc` is borrowed.
 fn doc_len(doc: &Document) -> usize {
     let mut count = 0;
     let mut stack = vec![doc.root()];
@@ -533,6 +685,12 @@ fn doc_len(doc: &Document) -> usize {
     count
 }
 
+/// Write `id`'s used style and recurse to its children.
+///
+/// Elements start from [`ComputedStyle::inherited_child`], then user-agent
+/// defaults, then author rules, then the inline `style` attribute. Text and
+/// the document node copy `parent` unchanged. `out` must be long enough for
+/// every reachable index; a short slot is skipped.
 fn walk(
     doc: &Document,
     id: NodeId,
@@ -564,6 +722,11 @@ fn walk(
     }
 }
 
+/// Apply author rules that match `id`, in specificity order, then source order.
+///
+/// A rule whose `@media` does not match `viewport_width` is skipped. Only the
+/// winning selector's specificity is kept per rule. Declarations are applied
+/// in rule order after the sort, so a later tied rule overrides an earlier one.
 fn apply_author(
     style: &mut ComputedStyle,
     doc: &Document,
@@ -596,6 +759,13 @@ fn apply_author(
     }
 }
 
+/// Tag defaults applied before author CSS. `tag` is borrowed and already lowercase.
+///
+/// Block tags become `display: block`. `base`, `head`, `link`, `meta`,
+/// `option`, `script`, `style`, and `title` become `display: none`. `body`
+/// gets an 8px margin. Tables, lists, rules, links, forms, and form controls
+/// get the fixed padding, borders, and colors written below. Heading sizes
+/// replace the inherited font size for `h1` through `h4` and `small`.
 fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     if is_block_tag(tag) {
         style.display = Display::Block;
@@ -719,6 +889,7 @@ fn apply_user_agent(style: &mut ComputedStyle, tag: &str) {
     };
 }
 
+/// Tags that the user agent displays as blocks. Not a CSS parser.
 fn is_block_tag(tag: &str) -> bool {
     matches!(
         tag,
@@ -758,6 +929,12 @@ fn is_block_tag(tag: &str) -> bool {
     )
 }
 
+/// Apply one declaration. Unknown properties and unparsed values are ignored.
+///
+/// `display: grid` and `var(--token)` are unknown and do nothing. Lengths that
+/// are not `px` or `0` are ignored, except `width`, `height`, `max-width`,
+/// and the offset properties, which become [`Size::Auto`]. `overflow` values
+/// `scroll` and `auto` are stored as [`Overflow::Hidden`].
 fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
     let value = declaration.value.trim();
     match declaration.name.as_str() {
@@ -968,6 +1145,9 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
     }
 }
 
+/// `border: none` and `border: 0` clear the width. Otherwise the first parsed
+/// length and color in the shorthand set every side. Style keywords such as
+/// `solid` are ignored by [`parse_border_side`].
 fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
     if value.eq_ignore_ascii_case("none") || value == "0" {
         style.border = Edge::zero();
@@ -981,6 +1161,10 @@ fn apply_border_shorthand(style: &mut ComputedStyle, value: &str) {
     }
 }
 
+/// Split a border side into a pixel width and an optional color.
+///
+/// `None` when no length token parses. `solid`, `dashed`, `dotted`, and
+/// `double` are skipped. The color is `None` when no color token parses.
 fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
     let mut width = None;
     let mut color = None;
@@ -999,6 +1183,8 @@ fn parse_border_side(value: &str) -> Option<(f32, Option<Color>)> {
     Some((width?, color))
 }
 
+/// Whitespace-separated tokens. Parentheses keep internal spaces, so
+/// `rgb(0, 0, 0)` stays one token. The slices borrow `value`.
 fn split_css_tokens(value: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = None;
@@ -1032,6 +1218,8 @@ fn split_css_tokens(value: &str) -> Vec<&str> {
     out
 }
 
+/// `auto`, `none`, or a non-pixel length becomes [`Size::Auto`]. A `px` length
+/// or `0` becomes [`Size::Px`].
 fn parse_size(value: &str) -> Size {
     if value == "auto" || value == "none" {
         Size::Auto
@@ -1040,6 +1228,8 @@ fn parse_size(value: &str) -> Size {
     }
 }
 
+/// One to four pixel lengths into an [`Edge`], using the CSS shorthand cycle.
+/// `None` when a token is not a pixel length or there are more than four.
 fn parse_edge(value: &str) -> Option<Edge> {
     let parts: Vec<f32> = value
         .split_whitespace()
@@ -1069,6 +1259,8 @@ fn parse_edge(value: &str) -> Option<Edge> {
     })
 }
 
+/// Parse `0` or a number with a `px` suffix. Other units, including bare
+/// numbers other than `0`, return `None`.
 fn parse_px(value: &str) -> Option<f32> {
     let value = value.trim();
     if value == "0" {
@@ -1077,6 +1269,9 @@ fn parse_px(value: &str) -> Option<f32> {
     value.strip_suffix("px")?.parse().ok()
 }
 
+/// Parse `offset-x offset-y blur spread color`. At least two lengths are required.
+/// Missing blur and spread are 0. A missing color is black at alpha 128.
+/// `None` when fewer than two lengths parse. `inset` is not recognized.
 fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
     let mut lengths = Vec::new();
     let mut color = Color {
@@ -1104,6 +1299,13 @@ fn parse_box_shadow(value: &str) -> Option<BoxShadow> {
     })
 }
 
+/// Parse `linear-gradient(...)`. `None` if the function is not that name or
+/// fewer than two color stops remain after the direction.
+///
+/// A leading `<angle>deg` sets the angle. `to right`, `to left`, `to top`,
+/// and `to bottom` map to 90, 270, 0, and 180. Any other `to ` direction
+/// becomes 135. With no direction the angle is 180 (downward). Only the first
+/// and last color stops are kept. Stop positions are ignored.
 fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -1165,10 +1367,14 @@ fn parse_linear_gradient(value: &str) -> Option<LinearGradient> {
     })
 }
 
+/// Split a selector list on commas. A group that fails to parse is dropped.
 fn parse_selectors(source: &str) -> Vec<Selector> {
     source.split(',').filter_map(parse_selector).collect()
 }
 
+/// Parse one selector. Compounds are split on whitespace, so the combinator
+/// is always the descendant combinator. `None` when any compound fails or the
+/// selector is empty. `>`, `+`, and `~` make the compound fail.
 fn parse_selector(source: &str) -> Option<Selector> {
     let mut chain = Vec::new();
     for token in source.split_whitespace() {
@@ -1182,6 +1388,10 @@ fn parse_selector(source: &str) -> Option<Selector> {
     }
 }
 
+/// Parse one compound: `*`, a tag, and then `#id` or `.class` pieces.
+///
+/// `None` for an empty token, a bad character, or an empty identifier.
+/// The tag is lowercased. Id and class text keep their case.
 fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
     let token = token.trim();
     if token.is_empty() {
@@ -1229,6 +1439,11 @@ fn parse_compound_selector(token: &str) -> Option<CompoundSelector> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Parse `name: value` pairs separated by `;`.
+///
+/// Names are owned and lowercased. Values are owned and trimmed. A pair with
+/// an empty name or value is dropped. `!important` is left in the value and
+/// is not special. `source` is borrowed.
 pub fn parse_declarations(source: &str) -> Vec<Declaration> {
     source
         .split(';')
@@ -1245,6 +1460,8 @@ pub fn parse_declarations(source: &str) -> Vec<Declaration> {
         .collect()
 }
 
+/// Copy `input` with `/* ... */` comments replaced by one space.
+/// An unclosed comment runs to the end of the string. The result is owned.
 fn strip_comments(input: &str) -> String {
     let mut out = String::new();
     let mut chars = input.chars().peekable();
@@ -1265,6 +1482,9 @@ fn strip_comments(input: &str) -> String {
     out
 }
 
+/// Parse the inside of `rgb()` or `rgba()`. Channels are integers 0–255.
+/// When `has_alpha` is set, a dotted alpha of at most 1 is a fraction.
+/// `None` when the channel count or a parse fails.
 fn parse_rgb(inner: &str, has_alpha: bool) -> Option<Color> {
     let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
     if (!has_alpha && parts.len() != 3) || (has_alpha && parts.len() != 4) {
@@ -1286,6 +1506,7 @@ fn parse_rgb(inner: &str, has_alpha: bool) -> Option<Color> {
     Some(Color { r, g, b, a })
 }
 
+/// Parse 3, 4, 6, or 8 hex digits. Short digits are expanded. `None` otherwise.
 fn parse_hex(hex: &str) -> Option<Color> {
     let chars: Vec<char> = hex.chars().collect();
     let component = |text: &[char]| -> Option<u8> {
@@ -1327,6 +1548,8 @@ fn parse_hex(hex: &str) -> Option<Color> {
 
 #[cfg(test)]
 mod tests {
+    //! Cascade order, inheritance, media queries, and a few declaration parsers.
+
     use super::*;
     use flux_dom::parse_html;
 

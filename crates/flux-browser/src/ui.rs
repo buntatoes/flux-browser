@@ -1,7 +1,17 @@
-//! Flux window interface: modern studio-slate tab strip, unified Omnibox capsule,
-//! geometric vector toolbar icons, Top-Right Hamburger App Menu (`≡`) popover,
-//! Bottom-Docked Developer Inspector (`F12`), Find-in-Page (`Ctrl+F`) bar,
-//! Right-Click Context Menu, and status bar.
+//! Toolbar, menus, and the CPU frame.
+//!
+//! compose_frame paints the tabs, navigation bar, bookmarks, page image,
+//! inspector dock, find marks, and status bar into a Framebuffer.
+//! shell copies that buffer to the window. This file does not present
+//! with a GPU.
+//!
+//! Hit tests take window pixels. A page hit subtracts the header from y.
+//! Find marks are scaled by Session::zoom_factor, shifted by Session::scroll,
+//! then moved down by the header.
+//!
+//! Zoom steps live on Session in lib.rs. This file draws the percent and
+//! the zoom control. The settings control is only a hit target. shell opens
+//! flux://settings. Nothing here pauses the session, and F9 is not handled.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -13,23 +23,40 @@ use flux_raster::{Color, Framebuffer};
 use crate::logo::render_flux_logo;
 use crate::{SearchEngine, Session, Viewport};
 
+/// Height of the tab strip, in window pixels.
 pub const TAB_STRIP_HEIGHT: f32 = 38.0;
+/// Height of the navigation bar under the tabs.
 pub const NAV_BAR_HEIGHT: f32 = 42.0;
+/// Extra header height used when the session has bookmarks.
 pub const BOOKMARKS_BAR_HEIGHT: f32 = 28.0;
+/// Height of the status bar at the bottom of the window.
 pub const STATUS_BAR_HEIGHT: f32 = 24.0;
+/// Width of the page scrollbar drawn over the right edge.
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
+/// Tab strip plus navigation bar. The bookmarks row is not included.
 pub const TOP_BAR_HEIGHT: f32 = TAB_STRIP_HEIGHT + NAV_BAR_HEIGHT;
+/// Height of the inspector dock above the status bar.
 pub const INSPECTOR_DOCK_HEIGHT: f32 = 186.0;
+/// Height of the dock row that holds the inspector tabs.
 pub const INSPECTOR_HEADER_HEIGHT: f32 = 32.0;
 
+/// Width of the floating find bar.
 const FIND_BAR_WIDTH: f32 = 316.0;
+/// Height of the floating find bar.
 const FIND_BAR_HEIGHT: f32 = 36.0;
+/// Width of the right-click menu.
 const CTX_MENU_WIDTH: f32 = 216.0;
+/// Height of one right-click menu row, used for hit testing.
 const CTX_MENU_ROW_H: f32 = 26.0;
+/// Width of the app menu.
 const APP_MENU_WIDTH: f32 = 252.0;
+/// Height of the app menu title row. Rows start below it.
 const APP_MENU_HEADER_H: f32 = 28.0;
+/// Height of one app menu row, used for hit testing.
 const APP_MENU_ROW_H: f32 = 27.0;
 
+/// Pixels from the top of the window down to the page.
+/// Adds BOOKMARKS_BAR_HEIGHT when the session has at least one bookmark.
 pub fn top_header_height(session: &Session) -> f32 {
     if session.bookmarks().is_empty() {
         TOP_BAR_HEIGHT
@@ -38,151 +65,176 @@ pub fn top_header_height(session: &Session) -> f32 {
     }
 }
 
-// Modern Matte Charcoal & Flux Orange Palette (Harmonized with the Flux Circular 'F' Emblem)
+// Frame colors. Each value is passed through to the rasterizer.
+/// Base fill for the tab strip and the window background.
 const STRIP_BG: Color = Color {
     r: 17,
     g: 20,
     b: 27,
     a: 255,
 };
+/// Fill for a tab that is not active.
 const TAB_IDLE_BG: Color = Color {
     r: 22,
     g: 26,
     b: 35,
     a: 255,
 };
+/// Lighter end of the navigation and active-tab gradient.
 const NAV_TOP_BG: Color = Color {
     r: 28,
     g: 33,
     b: 45,
     a: 255,
 };
+/// Fill for the navigation bar and the active tab.
 const NAV_BG: Color = Color {
     r: 22,
     g: 26,
     b: 35,
     a: 255,
 };
+/// Fill for a toolbar button that is not hovered.
 const CONTROL_BG: Color = Color {
     r: 33,
     g: 39,
     b: 54,
     a: 255,
 };
+/// Fill for a hovered button or tab.
 const CONTROL_HOVER_BG: Color = Color {
     r: 46,
     g: 55,
     b: 74,
     a: 255,
 };
+/// Fill for a button marked active.
 const CONTROL_ACTIVE_BG: Color = Color {
     r: 44,
     g: 32,
     b: 29,
     a: 255,
 };
+/// Fill for the app menu, context menu, and find bar.
 const OVERLAY_BG: Color = Color {
     r: 22,
     g: 26,
     b: 35,
     a: 252,
 };
+/// Shadow under floating menus and the find bar.
 const OVERLAY_SHADOW: Color = Color {
     r: 0,
     g: 0,
     b: 0,
     a: 185,
 };
+/// Fill for the address field.
 const FIELD_BG: Color = Color {
     r: 13,
     g: 16,
     b: 22,
     a: 255,
 };
+/// Hairline used between bars and around controls.
 const DIVIDER: Color = Color {
     r: 46,
     g: 54,
     b: 70,
     a: 255,
 };
+/// Mark color for the active tab, focus, and the security action.
 const ACCENT: Color = Color {
     r: 255,
     g: 107,
     b: 36,
     a: 255,
 };
+/// Secondary mark for hover and inactive find matches.
 const ACCENT_CYAN: Color = Color {
     r: 88,
     g: 166,
     b: 255,
     a: 255,
 };
+/// Fill for the current find match.
 const MATCH_HIGHLIGHT_ACTIVE: Color = Color {
     r: 232,
     g: 195,
     b: 122,
     a: 115,
 };
+/// Fill for the other find matches.
 const MATCH_HIGHLIGHT_IDLE: Color = Color {
     r: 88,
     g: 166,
     b: 255,
     a: 80,
 };
+/// Main text and enabled icon color.
 const INK_PRIMARY: Color = Color {
     r: 241,
     g: 245,
     b: 249,
     a: 255,
 };
+/// Secondary text and the idle close icon.
 const INK_MUTED: Color = Color {
     r: 148,
     g: 163,
     b: 184,
     a: 255,
 };
+/// Icon color when a button is disabled.
 const INK_DIM: Color = Color {
     r: 82,
     g: 96,
     b: 117,
     a: 255,
 };
+/// Background for an https security badge.
 const BADGE_TLS_BG: Color = Color {
     r: 15,
     g: 47,
     b: 33,
     a: 255,
 };
+/// Text color for an https security badge.
 const BADGE_TLS_FG: Color = Color {
     r: 110,
     g: 231,
     b: 183,
     a: 255,
 };
+/// Background for a flux:// security badge. The text uses ACCENT.
 const BADGE_SYS_BG: Color = Color {
     r: 41,
     g: 34,
     b: 20,
     a: 255,
 };
+/// Background for an http security badge.
 const BADGE_HTTP_BG: Color = Color {
     r: 54,
     g: 32,
     b: 16,
     a: 255,
 };
+/// Text color for an http security badge.
 const BADGE_HTTP_FG: Color = Color {
     r: 251,
     g: 191,
     b: 36,
     a: 255,
 };
+/// Background for a local-file security badge.
 const BADGE_FILE_BG: Color = Color {
     r: 19,
     g: 37,
     b: 58,
     a: 255,
 };
+/// Text color for a local-file security badge.
 const BADGE_FILE_FG: Color = Color {
     r: 125,
     g: 211,
@@ -190,6 +242,8 @@ const BADGE_FILE_FG: Color = Color {
     a: 255,
 };
 
+/// One row of the right-click menu.
+/// shortcut is a label. shell.rs implements the keys on Windows. Linux does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextMenuAction {
     Back,
@@ -204,6 +258,7 @@ pub enum ContextMenuAction {
 }
 
 impl ContextMenuAction {
+    /// Order used both to draw the rows and to turn a click into an action.
     pub const ALL: [Self; 9] = [
         Self::Back,
         Self::Forward,
@@ -216,6 +271,7 @@ impl ContextMenuAction {
         Self::SecurityCenter,
     ];
 
+    /// Text drawn for this right-click row.
     pub fn label(self) -> &'static str {
         match self {
             Self::Back => "Back",
@@ -230,6 +286,7 @@ impl ContextMenuAction {
         }
     }
 
+    /// Hint drawn beside the right-click row. It is not parsed as a key binding.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Back => "Alt+Left",
@@ -245,6 +302,8 @@ impl ContextMenuAction {
     }
 }
 
+/// One row of the app menu.
+/// CycleZoom and Settings are performed by shell.rs, not by this file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppMenuAction {
     NewTab,
@@ -260,6 +319,7 @@ pub enum AppMenuAction {
 }
 
 impl AppMenuAction {
+    /// Order used both to draw the rows and to turn a click into an action.
     pub const ALL: [Self; 10] = [
         Self::NewTab,
         Self::HomeDashboard,
@@ -273,6 +333,7 @@ impl AppMenuAction {
         Self::Settings,
     ];
 
+    /// Text drawn for this app-menu row.
     pub fn label(self) -> &'static str {
         match self {
             Self::NewTab => "New Tab",
@@ -288,6 +349,7 @@ impl AppMenuAction {
         }
     }
 
+    /// Hint drawn beside the app-menu row. It is not parsed as a key binding.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::NewTab => "Ctrl+T",
@@ -304,6 +366,7 @@ impl AppMenuAction {
     }
 }
 
+/// Tab inside the inspector dock. The default is Elements.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InspectorTab {
     #[default]
@@ -314,8 +377,10 @@ pub enum InspectorTab {
 }
 
 impl InspectorTab {
+    /// Order used both to draw the rows and to turn a click into an action.
     pub const ALL: [Self; 4] = [Self::Elements, Self::Styles, Self::Network, Self::Console];
 
+    /// Text drawn for this inspector tab.
     pub fn label(self) -> &'static str {
         match self {
             Self::Elements => "Elements (DOM)",
@@ -326,6 +391,8 @@ impl InspectorTab {
     }
 }
 
+/// What the pointer is over.
+/// Page x and y are page coordinates. Every other hit is decided in window coordinates.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiHit {
     Tab(usize),
@@ -357,6 +424,8 @@ pub enum UiHit {
     Page { x: f32, y: f32 },
 }
 
+/// Mutable chrome: address editing, loading, find, menus, the inspector, and the cursor.
+/// Zoom and the settings record are not stored here.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiState {
     editing_address: bool,
@@ -374,26 +443,32 @@ pub struct UiState {
 }
 
 impl UiState {
+    /// Empty chrome. The address bar is idle and no menu is open.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// True while the address bar has focus.
     pub fn is_editing_address(&self) -> bool {
         self.editing_address
     }
 
+    /// True from the start of a remote load until the page is installed.
     pub fn is_loading(&self) -> bool {
         self.loading
     }
 
+    /// Set or clear the loading flag drawn on the navigation bar.
     pub fn set_loading(&mut self, loading: bool) {
         self.loading = loading;
     }
 
+    /// Link under the pointer, if the last move reported one.
     pub fn hovered_link(&self) -> Option<&str> {
         self.hovered_link.as_deref()
     }
 
+    /// Store the hovered link. Returns false when the value did not change.
     pub fn set_hovered_link(&mut self, link: Option<String>) -> bool {
         if self.hovered_link == link {
             return false;
@@ -402,10 +477,13 @@ impl UiState {
         true
     }
 
+    /// Text currently in the address bar. The find query is separate.
     pub fn input(&self) -> &str {
         &self.input
     }
 
+    /// Focus the address bar, close find and both menus, and copy current_url.
+    /// flux://home clears the field instead of showing that URL.
     pub fn focus_address(&mut self, current_url: &str) {
         self.editing_address = true;
         self.find_open = false;
@@ -418,14 +496,18 @@ impl UiState {
         }
     }
 
+    /// Leave the address bar without navigating.
     pub fn blur_address(&mut self) {
         self.editing_address = false;
     }
 
+    /// Replace the address text. Does not change focus by itself.
     pub fn set_input(&mut self, text: &str) {
         self.input = text.to_string();
     }
 
+    /// Append printable ASCII to the address bar.
+    /// Returns false when the bar is not focused or the text adds nothing.
     pub fn paste_into_address(&mut self, text: &str) -> bool {
         if !self.editing_address {
             return false;
@@ -438,6 +520,7 @@ impl UiState {
         true
     }
 
+    /// Take the address text when the bar is focused and not empty.
     pub fn cut_address(&mut self) -> Option<String> {
         if !self.editing_address || self.input.is_empty() {
             return None;
@@ -445,6 +528,8 @@ impl UiState {
         Some(std::mem::take(&mut self.input))
     }
 
+    /// Append one printable ASCII character.
+    /// The address bar wins when it is focused. Otherwise the character goes to find.
     pub fn push_char(&mut self, ch: char) {
         if self.editing_address && (' '..='~').contains(&ch) {
             self.input.push(ch);
@@ -454,6 +539,7 @@ impl UiState {
         }
     }
 
+    /// Delete one character from the address bar, or from find when the bar is idle.
     pub fn backspace(&mut self) {
         if self.editing_address {
             self.input.pop();
@@ -463,10 +549,13 @@ impl UiState {
         }
     }
 
+    /// Submit the address bar with the Google search engine.
     pub fn submit_address(&mut self) -> Option<String> {
         self.submit_address_with_engine(SearchEngine::Google)
     }
 
+    /// Blur the address bar and turn the field into a URL or a search for engine.
+    /// Returns None when the bar was not focused.
     pub fn submit_address_with_engine(&mut self, engine: SearchEngine) -> Option<String> {
         if !self.editing_address {
             return None;
@@ -475,10 +564,12 @@ impl UiState {
         normalize_address_input_with_engine(&self.input, engine)
     }
 
+    /// True while the find bar is open.
     pub fn is_find_open(&self) -> bool {
         self.find_open
     }
 
+    /// Open find and close the address bar, the context menu, and the app menu.
     pub fn open_find(&mut self) {
         self.find_open = true;
         self.editing_address = false;
@@ -486,23 +577,28 @@ impl UiState {
         self.app_menu_open = false;
     }
 
+    /// Close the find bar. The query is kept.
     pub fn close_find(&mut self) {
         self.find_open = false;
     }
 
+    /// Current find string.
     pub fn find_query(&self) -> &str {
         &self.find_query
     }
 
+    /// Replace the find string and reset the active match to zero.
     pub fn set_find_query(&mut self, query: &str) {
         self.find_query = query.to_string();
         self.find_active_match = 0;
     }
 
+    /// Index of the match that scroll and the active highlight use.
     pub fn find_active_match(&self) -> usize {
         self.find_active_match
     }
 
+    /// Advance the match index, wrapping. Stays at zero when there are no matches.
     pub fn find_next(&mut self, total_matches: usize) -> usize {
         if total_matches == 0 {
             self.find_active_match = 0;
@@ -512,6 +608,7 @@ impl UiState {
         self.find_active_match
     }
 
+    /// Move to the previous match, wrapping. Stays at zero when there are no matches.
     pub fn find_prev(&mut self, total_matches: usize) -> usize {
         if total_matches == 0 {
             self.find_active_match = 0;
@@ -523,23 +620,29 @@ impl UiState {
         self.find_active_match
     }
 
+    /// Open the right-click menu at x, y and close the app menu. Values below 4 are raised.
     pub fn open_context_menu(&mut self, x: f32, y: f32) {
         self.app_menu_open = false;
         self.context_menu = Some((x.max(4.0), y.max(4.0)));
     }
 
+    /// Close the right-click menu.
     pub fn close_context_menu(&mut self) {
         self.context_menu = None;
     }
 
+    /// Anchor of the right-click menu, in window pixels.
     pub fn context_menu_pos(&self) -> Option<(f32, f32)> {
         self.context_menu
     }
 
+    /// True while the app menu is open.
     pub fn is_app_menu_open(&self) -> bool {
         self.app_menu_open
     }
 
+    /// Toggle the app menu.
+    /// Opening it closes the context menu, find, and the address bar. Returns the new flag.
     pub fn toggle_app_menu(&mut self) -> bool {
         self.app_menu_open = !self.app_menu_open;
         if self.app_menu_open {
@@ -550,39 +653,48 @@ impl UiState {
         self.app_menu_open
     }
 
+    /// Close the app menu.
     pub fn close_app_menu(&mut self) {
         self.app_menu_open = false;
     }
 
+    /// True while the bottom inspector dock is open.
     pub fn is_inspector_open(&self) -> bool {
         self.inspector_open
     }
 
+    /// Toggle the inspector dock. Does not navigate. Returns the new flag.
     pub fn toggle_inspector(&mut self) -> bool {
         self.inspector_open = !self.inspector_open;
         self.inspector_open
     }
 
+    /// Open the inspector dock.
     pub fn open_inspector(&mut self) {
         self.inspector_open = true;
     }
 
+    /// Close the inspector dock.
     pub fn close_inspector(&mut self) {
         self.inspector_open = false;
     }
 
+    /// Which inspector tab is selected.
     pub fn inspector_tab(&self) -> InspectorTab {
         self.inspector_tab
     }
 
+    /// Select an inspector tab. The dock stays as it was.
     pub fn set_inspector_tab(&mut self, tab: InspectorTab) {
         self.inspector_tab = tab;
     }
 
+    /// Last pointer position in window pixels.
     pub fn cursor_pos(&self) -> Option<(f32, f32)> {
         self.cursor_pos
     }
 
+    /// Store the pointer. Returns false when it did not move.
     pub fn set_cursor_pos(&mut self, x: f32, y: f32) -> bool {
         let next = Some((x, y));
         if self.cursor_pos == next {
@@ -592,6 +704,7 @@ impl UiState {
         true
     }
 
+    /// True when the stored pointer lies inside rect.
     pub fn is_hovering(&self, rect: Rect) -> bool {
         self.cursor_pos
             .is_some_and(|(cx, cy)| rect.contains(cx, cy))
@@ -648,10 +761,16 @@ impl UiState {
     }
 }
 
+/// Normalize an address with the Google search engine.
 pub fn normalize_address_input(raw: &str) -> Option<String> {
     normalize_address_input_with_engine(raw, SearchEngine::Google)
 }
 
+/// Turn address text into a navigation target.
+/// Rejects javascript, data, and vbscript. Keeps flux, http, and https.
+/// about:home and about:blank become flux://home.
+/// An existing path, a backslash, or an html suffix stays a file path.
+/// A dotted token with no spaces becomes https. Anything else is a search URL.
 pub fn normalize_address_input_with_engine(raw: &str, engine: SearchEngine) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -686,6 +805,9 @@ pub fn normalize_address_input_with_engine(raw: &str, engine: SearchEngine) -> O
     Some(engine.search_url(trimmed))
 }
 
+/// Page size passed to the session.
+/// Width is the window width. Height subtracts the tab strip, navigation bar, and status bar.
+/// The bookmarks row and the inspector dock are not subtracted.
 pub fn content_viewport(window_width: f32, window_height: f32) -> Viewport {
     Viewport {
         width: window_width.max(1.0),
@@ -693,11 +815,14 @@ pub fn content_viewport(window_width: f32, window_height: f32) -> Viewport {
     }
 }
 
+/// Hit-test with a default UiState and a stand-in window height of 720.
+/// Callers that know the height should use hit_test_ui_with_state_and_height.
 pub fn hit_test_ui(session: &Session, window_width: f32, x: f32, y: f32) -> Option<UiHit> {
     let default_ui = UiState::new();
     hit_test_ui_with_state_and_height(session, &default_ui, window_width, 720.0, x, y)
 }
 
+/// Hit-test with the given chrome state and a stand-in window height of 720.
 pub fn hit_test_ui_with_state(
     session: &Session,
     ui: &UiState,
@@ -708,6 +833,9 @@ pub fn hit_test_ui_with_state(
     hit_test_ui_with_state_and_height(session, ui, window_width, 720.0, x, y)
 }
 
+/// Hit-test x and y in window pixels.
+/// Menus, find, the tab strip, the navigation bar, bookmarks, the dock, and the scrollbar win first.
+/// A remaining point becomes a page hit. y drops the header. x is not shifted.
 pub fn hit_test_ui_with_state_and_height(
     session: &Session,
     ui: &UiState,
@@ -862,43 +990,27 @@ pub fn hit_test_ui_with_state_and_height(
     // 8. Vertical Scrollbar
     if session.max_scroll() > 0.0 && x >= (window_width - SCROLLBAR_WIDTH).max(0.0) {
         let page_h = session.viewport().height.max(1.0);
+        // Scroll ratio from y under the header over the layout viewport, not over the thumb track.
         let ratio = ((y - header_h) / page_h).clamp(0.0, 1.0);
         return Some(UiHit::Scrollbar { ratio });
     }
 
+    // Window y to page y: subtract the header. x is unchanged because the page is not inset.
     Some(UiHit::Page { x, y: y - header_h })
 }
 
+/// Badge label, colors, and status text for a URL.
+/// https is TLS, flux is SYS, http is HTTP, an empty URL is IDLE, and anything else is FILE.
 fn classify_url_security(url: &str) -> (&'static str, Color, Color, &'static str) {
     let trimmed = url.trim();
     if trimmed.starts_with("https://") {
-        (
-            "TLS",
-            BADGE_TLS_BG,
-            BADGE_TLS_FG,
-            "HTTPS",
-        )
+        ("TLS", BADGE_TLS_BG, BADGE_TLS_FG, "HTTPS")
     } else if trimmed.starts_with("flux://") {
-        (
-            "SYS",
-            BADGE_SYS_BG,
-            ACCENT,
-            "Flux page",
-        )
+        ("SYS", BADGE_SYS_BG, ACCENT, "Flux page")
     } else if trimmed.starts_with("http://") {
-        (
-            "HTTP",
-            BADGE_HTTP_BG,
-            BADGE_HTTP_FG,
-            "Plain HTTP",
-        )
+        ("HTTP", BADGE_HTTP_BG, BADGE_HTTP_FG, "Plain HTTP")
     } else if trimmed.is_empty() {
-        (
-            "IDLE",
-            CONTROL_BG,
-            INK_MUTED,
-            "Plain HTTP",
-        )
+        ("IDLE", CONTROL_BG, INK_MUTED, "Plain HTTP")
     } else {
         (
             "FILE",
@@ -909,6 +1021,9 @@ fn classify_url_security(url: &str) -> (&'static str, Color, Color, &'static str
     }
 }
 
+/// Paint one window frame into a CPU framebuffer.
+/// The page image from Session::rasterize is copied below the header.
+/// This does not present to a window and does not use a GPU.
 pub fn compose_frame(
     session: &Session,
     ui: &UiState,
@@ -1350,6 +1465,7 @@ pub fn compose_frame(
 
     // 6. Blit Page Viewport
     let header_h = top_header_height(session);
+    // CPU page image. Rows are copied starting at the header. This is not a GPU present.
     let page_fb = session.rasterize();
     let top_y = header_h as u32;
     let status_h_u32 = STATUS_BAR_HEIGHT as u32;
@@ -1367,6 +1483,7 @@ pub fn compose_frame(
     for py in 0..copy_h {
         for px in 0..copy_w {
             if let Some(color) = page_fb.pixel(px, py) {
+                // Window row is the header plus this page row.
                 fb.set_pixel(px as i32, (top_y + py) as i32, color);
             }
         }
@@ -1410,7 +1527,9 @@ pub fn compose_frame(
         let active_idx = ui.find_active_match();
         let viewport_bottom = header_h + avail_h as f32;
         for (idx, m) in matches.iter().enumerate() {
+            // Page x to window x. Only the zoom scale is applied.
             let sx = m.x * z;
+            // Page y to window y: scale by zoom, subtract scroll, then add the header.
             let sy = header_h + (m.y * z) - session.scroll();
             let sw = m.width * z;
             let sh = m.height * z;
@@ -1708,6 +1827,8 @@ pub fn compose_frame(
     fb
 }
 
+/// Paint the open inspector dock above the status bar.
+/// Switching tabs changes the text only. It does not navigate.
 fn compose_inspector_dock(
     fb: &mut Framebuffer,
     session: &Session,
@@ -2327,6 +2448,8 @@ fn compose_inspector_dock(
     }
 }
 
+/// Rounded toolbar button.
+/// Disabled icons use the dim color. active selects the pressed fill.
 fn draw_icon_button(
     fb: &mut Framebuffer,
     ui: &UiState,
@@ -2364,6 +2487,7 @@ fn draw_icon_button(
     icon_fn(fb, rect, fg);
 }
 
+/// Plus glyph for the new-tab button.
 fn draw_plus_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2371,6 +2495,7 @@ fn draw_plus_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(cx - 1.0, cy - 5.0, 2.0, 10.0, color);
 }
 
+/// X glyph used to close a tab.
 fn draw_close_x_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round() as i32;
     let cy = (rect.y + rect.height * 0.5).round() as i32;
@@ -2380,6 +2505,7 @@ fn draw_close_x_icon(fb: &mut Framebuffer, rect: Rect, color: Color) {
     }
 }
 
+/// Left arrow for the back button.
 fn draw_nav_icon_back(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2391,6 +2517,7 @@ fn draw_nav_icon_back(fb: &mut Framebuffer, rect: Rect, color: Color) {
     }
 }
 
+/// Right arrow for the forward button.
 fn draw_nav_icon_forward(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2402,6 +2529,7 @@ fn draw_nav_icon_forward(fb: &mut Framebuffer, rect: Rect, color: Color) {
     }
 }
 
+/// Circular arrow for reload.
 fn draw_nav_icon_reload(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2415,6 +2543,7 @@ fn draw_nav_icon_reload(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(cx, cy - 5.0, 5.0, 2.0, color);
 }
 
+/// House glyph for the start page.
 fn draw_nav_icon_home(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2435,6 +2564,7 @@ fn draw_nav_icon_home(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(cx - 4.0, cy + 4.0, 8.0, 2.0, color);
 }
 
+/// Star glyph. filled draws the bookmarked shape.
 fn draw_nav_icon_star(fb: &mut Framebuffer, rect: Rect, color: Color, filled: bool) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2447,6 +2577,8 @@ fn draw_nav_icon_star(fb: &mut Framebuffer, rect: Rect, color: Color, filled: bo
     }
 }
 
+/// Gear glyph for the settings button.
+/// Drawing it does not change settings. shell.rs opens flux://settings on click.
 fn draw_nav_icon_settings(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let x0 = (rect.x + 7.0).round();
     let y0 = (rect.y + 8.0).round();
@@ -2461,6 +2593,7 @@ fn draw_nav_icon_settings(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(x0 + 4.0, y0 + 9.0, 3.0, 4.0, ACCENT);
 }
 
+/// Down-arrow glyph for the downloads button.
 fn draw_nav_icon_downloads(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2474,6 +2607,7 @@ fn draw_nav_icon_downloads(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(cx + 4.0, cy + 2.0, 2.0, 4.0, color);
 }
 
+/// Bracket glyph for the inspector button.
 fn draw_nav_icon_inspector(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let cx = (rect.x + rect.width * 0.5).round();
     let cy = (rect.y + rect.height * 0.5).round();
@@ -2491,6 +2625,7 @@ fn draw_nav_icon_inspector(fb: &mut Framebuffer, rect: Rect, color: Color) {
     }
 }
 
+/// Three bars for the app menu button.
 fn draw_nav_icon_hamburger(fb: &mut Framebuffer, rect: Rect, color: Color) {
     let x0 = (rect.x + 7.0).round();
     let y0 = (rect.y + 8.0).round();
@@ -2499,11 +2634,13 @@ fn draw_nav_icon_hamburger(fb: &mut Framebuffer, rect: Rect, color: Color) {
     fb.fill_rect(x0, y0 + 10.0, 14.0, 2.0, color);
 }
 
+/// Cached 24 pixel logo painted in the tab strip.
 fn top_bar_logo() -> &'static Image {
     static LOGO: OnceLock<Image> = OnceLock::new();
     LOGO.get_or_init(|| render_flux_logo(24))
 }
 
+/// Logo bounds, 24 by 24 at (8, 7). A hit here is the home action.
 fn logo_rect() -> Rect {
     Rect {
         x: 8.0,
@@ -2513,6 +2650,7 @@ fn logo_rect() -> Rect {
     }
 }
 
+/// Find bar under the header, aligned to the right.
 fn find_bar_rect(window_width: f32, header_h: f32) -> Rect {
     Rect {
         x: (window_width - FIND_BAR_WIDTH - 20.0).max(8.0),
@@ -2522,6 +2660,7 @@ fn find_bar_rect(window_width: f32, header_h: f32) -> Rect {
     }
 }
 
+/// Previous-match button inside the find bar.
 fn find_prev_rect(fbar: Rect) -> Rect {
     Rect {
         x: fbar.x + fbar.width - 86.0,
@@ -2531,6 +2670,7 @@ fn find_prev_rect(fbar: Rect) -> Rect {
     }
 }
 
+/// Next-match button inside the find bar.
 fn find_next_rect(fbar: Rect) -> Rect {
     Rect {
         x: fbar.x + fbar.width - 58.0,
@@ -2540,6 +2680,7 @@ fn find_next_rect(fbar: Rect) -> Rect {
     }
 }
 
+/// Close button inside the find bar.
 fn find_close_rect(fbar: Rect) -> Rect {
     Rect {
         x: fbar.x + fbar.width - 30.0,
@@ -2549,6 +2690,7 @@ fn find_close_rect(fbar: Rect) -> Rect {
     }
 }
 
+/// App menu under the header, aligned to the right. Height follows the row count.
 fn app_menu_rect(window_width: f32, header_h: f32) -> Rect {
     let total_h = APP_MENU_HEADER_H + 8.0 + (AppMenuAction::ALL.len() as f32) * APP_MENU_ROW_H;
     Rect {
@@ -2559,6 +2701,7 @@ fn app_menu_rect(window_width: f32, header_h: f32) -> Rect {
     }
 }
 
+/// Right-click menu at the click, clamped so it stays inside the window.
 fn context_menu_rect(x: f32, y: f32, window_width: f32) -> Rect {
     let total_h = 8.0 + (ContextMenuAction::ALL.len() as f32) * CTX_MENU_ROW_H;
     let clamped_x = x.clamp(4.0, (window_width - CTX_MENU_WIDTH - 4.0).max(4.0));
@@ -2570,6 +2713,8 @@ fn context_menu_rect(x: f32, y: f32, window_width: f32) -> Rect {
     }
 }
 
+/// Inspector dock above the status bar.
+/// On a short window the top is clamped to TOP_BAR_HEIGHT.
 fn inspector_dock_rect(window_width: f32, window_height: f32) -> Rect {
     let y = (window_height - STATUS_BAR_HEIGHT - INSPECTOR_DOCK_HEIGHT).max(TOP_BAR_HEIGHT);
     Rect {
@@ -2580,6 +2725,7 @@ fn inspector_dock_rect(window_width: f32, window_height: f32) -> Rect {
     }
 }
 
+/// One inspector tab. index is zero through three.
 fn inspector_tab_rect(dock: Rect, index: usize) -> Rect {
     let tab_w = 122.0;
     Rect {
@@ -2590,6 +2736,7 @@ fn inspector_tab_rect(dock: Rect, index: usize) -> Rect {
     }
 }
 
+/// Full Page button in the dock header.
 fn inspector_full_page_rect(dock: Rect) -> Rect {
     Rect {
         x: (dock.x + dock.width - 106.0).max(dock.x + 600.0),
@@ -2599,6 +2746,7 @@ fn inspector_full_page_rect(dock: Rect) -> Rect {
     }
 }
 
+/// Close button in the dock header.
 fn inspector_close_rect(dock: Rect) -> Rect {
     Rect {
         x: (dock.x + dock.width - 32.0).max(dock.x + 672.0),
@@ -2608,11 +2756,13 @@ fn inspector_close_rect(dock: Rect) -> Rect {
     }
 }
 
+/// Tab width from the leftover strip, clamped between 72 and 188.
 fn tab_width(window_width: f32, count: usize) -> f32 {
     let available = (window_width - 82.0).max(72.0);
     (available / (count as f32)).clamp(72.0, 188.0)
 }
 
+/// Tab bounds. x starts at 38 so the logo stays clear.
 fn tab_rect(index: usize, tab_w: f32) -> Rect {
     Rect {
         x: 38.0 + (index as f32) * (tab_w + 4.0),
@@ -2622,6 +2772,7 @@ fn tab_rect(index: usize, tab_w: f32) -> Rect {
     }
 }
 
+/// Close glyph inside a tab.
 fn close_rect(tab: Rect) -> Rect {
     Rect {
         x: tab.x + tab.width - 22.0,
@@ -2631,6 +2782,7 @@ fn close_rect(tab: Rect) -> Rect {
     }
 }
 
+/// Plus button just after the last tab.
 fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
     Rect {
         x: 38.0 + (count as f32) * (tab_w + 4.0),
@@ -2640,6 +2792,7 @@ fn new_tab_rect(count: usize, tab_w: f32) -> Rect {
     }
 }
 
+/// Back button on the navigation bar.
 fn back_rect() -> Rect {
     Rect {
         x: 8.0,
@@ -2649,6 +2802,7 @@ fn back_rect() -> Rect {
     }
 }
 
+/// Forward button on the navigation bar.
 fn forward_rect() -> Rect {
     Rect {
         x: 40.0,
@@ -2658,6 +2812,7 @@ fn forward_rect() -> Rect {
     }
 }
 
+/// Reload button on the navigation bar.
 fn reload_rect() -> Rect {
     Rect {
         x: 72.0,
@@ -2667,6 +2822,7 @@ fn reload_rect() -> Rect {
     }
 }
 
+/// Home button on the navigation bar.
 fn home_rect() -> Rect {
     Rect {
         x: 104.0,
@@ -2676,6 +2832,7 @@ fn home_rect() -> Rect {
     }
 }
 
+/// Security badge at the left of the address field.
 fn security_badge_rect() -> Rect {
     Rect {
         x: 136.0,
@@ -2685,6 +2842,7 @@ fn security_badge_rect() -> Rect {
     }
 }
 
+/// Address field. The width shrinks with the window and stops at 60.
 fn address_rect(window_width: f32) -> Rect {
     Rect {
         x: 184.0,
@@ -2694,6 +2852,7 @@ fn address_rect(window_width: f32) -> Rect {
     }
 }
 
+/// Bookmark toggle at the right of the address field.
 fn star_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 216.0).max(248.0),
@@ -2703,6 +2862,8 @@ fn star_rect(window_width: f32) -> Rect {
     }
 }
 
+/// Zoom percent button.
+/// The number is Session::zoom_percent. shell.rs resets it or zooms in.
 fn zoom_pill_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 184.0).max(280.0),
@@ -2712,6 +2873,7 @@ fn zoom_pill_rect(window_width: f32) -> Rect {
     }
 }
 
+/// Settings button. shell.rs opens flux://settings. This rect does not pause.
 fn settings_btn_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 132.0).max(332.0),
@@ -2721,6 +2883,7 @@ fn settings_btn_rect(window_width: f32) -> Rect {
     }
 }
 
+/// Downloads button on the navigation bar.
 fn downloads_btn_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 100.0).max(364.0),
@@ -2730,6 +2893,7 @@ fn downloads_btn_rect(window_width: f32) -> Rect {
     }
 }
 
+/// Inspector button. shell.rs toggles the dock, including with F12 on Windows.
 fn inspector_btn_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 68.0).max(396.0),
@@ -2739,6 +2903,7 @@ fn inspector_btn_rect(window_width: f32) -> Rect {
     }
 }
 
+/// App menu button at the right of the navigation bar.
 fn app_menu_btn_rect(window_width: f32) -> Rect {
     Rect {
         x: (window_width - 36.0).max(428.0),
@@ -2748,6 +2913,7 @@ fn app_menu_btn_rect(window_width: f32) -> Rect {
     }
 }
 
+/// One bookmark pill. y sits just under TOP_BAR_HEIGHT.
 fn bookmark_rect(index: usize) -> Rect {
     let pill_w = 112.0;
     Rect {
@@ -2758,6 +2924,7 @@ fn bookmark_rect(index: usize) -> Rect {
     }
 }
 
+/// Shorten text to max_chars. Cuts longer text with two dots when more than three characters remain.
 fn truncate(text: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
@@ -2771,6 +2938,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Keep the last max_chars characters.
 fn tail(text: &str, max_chars: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_chars {
@@ -2781,8 +2949,10 @@ fn tail(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Hit tests for toolbar rectangles and address normalization. No window is opened.
     use super::*;
 
+    /// Point checks for the logo, tabs, menus, find, inspector, bookmarks, and the page.
     #[test]
     fn hit_tests_tabs_controls_find_bar_context_menu_app_menu_inspector_and_page() {
         let mut session = Session::new(content_viewport(800.0, 600.0));
@@ -2911,6 +3081,7 @@ mod tests {
         );
     }
 
+    /// Address editing, submit, and normalization for direct URLs and the three search engines.
     #[test]
     fn edits_and_submits_address_field_input() {
         let mut ui = UiState::new();

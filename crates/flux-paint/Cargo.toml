@@ -1,3 +1,6 @@
+# Display list and zoom (50% to 250%). Reads flux-layout boxes.
+# flux-raster is the only consumer. This crate does not write a framebuffer.
+
 [package]
 name = "flux-paint"
 description = "Display list and zoom."

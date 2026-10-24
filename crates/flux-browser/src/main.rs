@@ -1,3 +1,12 @@
+//! Command line for the `flux` binary.
+//!
+//! `main` asks `flux-sandbox` to apply process limits, then `run` reads argv.
+//! A window goes through `shell::open` on Windows and Linux. `render` prints
+//! a `flux-paint` display list. `raster` writes a PPM file with `flux-raster`.
+//! `--tab-worker` handles one `flux-sandbox` IPC frame in this process.
+//! Ordinary tab navigation does not start that worker. `Session::open_target`
+//! in `lib.rs` loads pages in the window process.
+
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 use std::collections::HashMap;
@@ -18,9 +27,11 @@ use flux_sandbox::{read_ipc_frame, write_ipc_frame};
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    /// Attach to a console. `main` passes the parent-process id.
     fn AttachConsole(dw_process_id: u32) -> i32;
 }
 
+/// Apply sandbox limits, attach the parent console on Windows, then dispatch argv.
 fn main() -> ExitCode {
     // Quit if the sandbox limits cannot be set.
     let _mandatory_sandbox = enforce_mandatory_sandbox_or_abort();
@@ -38,14 +49,21 @@ fn main() -> ExitCode {
     }
 }
 
+/// Choose one argv path. The first token is the command unless it is a bare target.
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // No arguments: empty window.
         None => open_window(&[]),
+        // One stdin frame in, one stdout frame out. Not started by normal browsing.
         Some("--tab-worker") => run_tab_worker(),
+        // Print display-list lines. No window and no PPM file.
         Some("render") => render(&args[1..]),
+        // Headless PPM. No window.
         Some("raster") => raster(&args[1..]),
+        // Window, with an optional file or URL after the flags.
         Some("open" | "view") => open_window(&args[1..]),
+        // Copy into the per-user install directory via `installer::install_default`.
         Some("install" | "--install") => {
             let report = install_default()?;
             println!(
@@ -57,15 +75,18 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
+        // Remove that install directory and its shortcuts via `installer::uninstall_default`.
         Some("uninstall" | "--uninstall") => {
             let dir = uninstall_default()?;
             println!("uninstalled Flux Browser {VERSION} from {}", dir.display());
             Ok(())
         }
+        // Print `flux-browser` and the `VERSION` constant.
         Some("version" | "--version" | "-v") => {
             println!("flux-browser {VERSION}");
             Ok(())
         }
+        // Print the command list. This path does not open a window.
         Some("help" | "--help" | "-h") => {
             println!("flux-browser {VERSION}");
             println!("flux [file or http/https/flux URL]");
@@ -78,6 +99,7 @@ fn run() -> Result<(), String> {
             println!("flux uninstall");
             Ok(())
         }
+        // A bare http(s) URL, flux:// URL, or .html/.htm path opens a window on that target.
         Some(target)
             if target.starts_with("http://")
                 || target.starts_with("https://")
@@ -91,6 +113,14 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Read one worker request, render it here, and write one response.
+///
+/// `lock_current_worker_process_or_abort` applies the worker limits from
+/// `flux-sandbox`. The body is `render_html_with_resources_and_csp` with an
+/// empty stylesheet, an empty image map, and a 960 by 720 viewport. The CSP
+/// header and URL come from the request. The response is title, DOM node
+/// count, and blocked-resource count. This function does not open a window
+/// and does not read a second frame.
 fn run_tab_worker() -> Result<(), String> {
     lock_current_worker_process_or_abort();
     let mut stdin = io::stdin().lock();
@@ -120,6 +150,7 @@ fn run_tab_worker() -> Result<(), String> {
     write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())
 }
 
+/// Load one target and print each `flux-paint` display item as text.
 fn render(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
     let [target] = positional.as_slice() else {
@@ -227,6 +258,7 @@ fn render(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Load one target, rasterize it with `flux-raster`, and write a PPM file.
 fn raster(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
     let [target, output] = positional.as_slice() else {
@@ -244,6 +276,7 @@ fn raster(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Open `shell::open`. No positional argument starts blank. One argument is the first target.
 #[cfg(any(windows, target_os = "linux"))]
 fn open_window(args: &[String]) -> Result<(), String> {
     let (viewport, positional) = parse_viewport_args(args, 960.0, 720.0)?;
@@ -254,11 +287,13 @@ fn open_window(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The window shell is compiled only for Windows and Linux.
 #[cfg(not(any(windows, target_os = "linux")))]
 fn open_window(_args: &[String]) -> Result<(), String> {
     Err("the window shell is only built for Windows and Linux".to_string())
 }
 
+/// Pull `--width` and `--height` out of `args`. Everything else stays positional.
 fn parse_viewport_args(
     args: &[String],
     default_width: f32,

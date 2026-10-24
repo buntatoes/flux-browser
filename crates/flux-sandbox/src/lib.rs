@@ -1,40 +1,75 @@
-//! Process limits for Flux.
+//! Process limits for the window, plus a separate worker mode that normal browsing does not use.
 //!
-//! On Linux the window process sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off,
-//! and tries to cap address space at 2 GiB. `--tab-worker` caps address space at
-//! 256 MiB. Pages in the window are still drawn in this process. A panic in
-//! [`MandatorySandboxGuard::execute_isolated`] is caught here.
+//! `flux-browser` calls [`enforce_mandatory_sandbox_or_abort`] at startup and
+//! holds the [`MandatorySandboxGuard`] for the life of the process. Page loads
+//! run inside [`MandatorySandboxGuard::execute_isolated`], which is
+//! `catch_unwind` in this same process. It does not spawn a process. Tabs are
+//! still drawn by the window. This crate never starts `--tab-worker`.
+//! `flux-browser` only enters that path when the process was launched with
+//! the flag. The `FLUXIPC1` request and response types are the wire format
+//! for that mode. They are not evidence that a tab is out of process.
 //!
-//! [`enforce_mandatory_sandbox_or_abort`] quits if `PR_SET_NO_NEW_PRIVS` is rejected.
+//! Windows puts the window process in a Job Object with a 2 GiB process
+//! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
+//! does not set a process-count limit and does not set UI restrictions.
+//! `--tab-worker` on Windows uses a second job: 256 MiB, one active process,
+//! and `JOB_OBJECT_UILIMIT_ALL`. If that job cannot be applied the worker
+//! exits. The window path does not use it.
+//!
+//! Linux sets `PR_SET_NO_NEW_PRIVS` and refuses to start if that call is
+//! rejected. It sets `RLIMIT_CORE` to 0 and tries to cap `RLIMIT_AS` at 2 GiB
+//! without raising a limit that is already lower. A failed address-space cap
+//! does not abort the window. `--tab-worker` on Linux applies those same
+//! limits and then requires the 256 MiB cap. If that cap is missing or still
+//! above 256 MiB, the worker exits. Other operating systems are rejected.
+//!
+//! JSON frames use `flux-json` (`to_json_string` and `parse_json_bounded`).
+//! There is no GPU work and no script interpreter in this crate.
 
 use flux_json::{JsonValue, parse_json_bounded, to_json_string};
 use std::fmt;
 use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Address-space cap for `--tab-worker` (256 MiB).
+/// Address-space cap for `--tab-worker` (256 MiB). Not applied to the window process.
 pub const MANDATORY_TAB_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Address-space cap for the window process (2 GiB).
+/// Process-memory cap requested for the window (2 GiB).
+///
+/// On Linux this is an `RLIMIT_AS` target and may come back lower. On Windows
+/// it is `JOB_OBJECT_LIMIT_PROCESS_MEMORY`.
 pub const UI_ADDRESS_SPACE_LIMIT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Process count limit used by `--tab-worker` on Windows.
+/// `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` value for `--tab-worker` on Windows.
+/// The window job leaves the active-process limit at 0, which means unset.
 pub const MANDATORY_ACTIVE_PROCESS_LIMIT: u32 = 1;
 
-/// Largest `FLUXIPC1` frame body (8 MiB).
+/// Largest `FLUXIPC1` JSON body (8 MiB), not counting the 12-byte header.
 pub const MANDATORY_IPC_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// Deepest JSON object accepted on the worker pipe.
+/// Deepest JSON value accepted by [`decode_ipc_frame`], passed to `flux-json`.
 pub const MANDATORY_IPC_MAX_JSON_DEPTH: usize = 32;
 
-/// Worker time budget, in milliseconds. The window does not enforce this.
+/// Worker time budget, in milliseconds.
+///
+/// Nothing in this crate reads it. The window does not start a timer from it,
+/// and `--tab-worker` does not either.
 pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
 
-/// 8-byte wire magic header for `flux-sandbox` IPC frames.
+/// Eight-byte header of every worker frame. The next four bytes are a little-endian length.
 pub const IPC_MAGIC: &[u8; 8] = b"FLUXIPC1";
 
+/// Value stored in `MandatorySandboxGuard::seal`. A guard with any other value fails [`MandatorySandboxGuard::verify_active`].
 const SANDBOX_SEAL_TOKEN: u64 = 0x464C_5558_5342_5838; // "FLUXSBX8"
 
+/// Why setup, a guard check, a frame, or an isolated call failed.
+///
+/// `OsInitializationFailed` is a rejected OS call. `UnverifiedGuard` means the
+/// seal or, on Windows, the job handle is missing. `IpcFramingError` is a bad
+/// header, length, encoding, or JSON tree. `IpcPayloadTooLarge` is a body over
+/// [`MANDATORY_IPC_MAX_BYTES`]. `TabIsolatedFault` is a workload `Err` or a
+/// panic caught by [`MandatorySandboxGuard::execute_isolated`]. The panic stays
+/// in this process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SandboxError {
     OsInitializationFailed(String),
@@ -45,6 +80,7 @@ pub enum SandboxError {
 }
 
 impl fmt::Display for SandboxError {
+    /// One-line message. Payload-too-large includes the 8 MiB ceiling.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OsInitializationFailed(reason) => {
@@ -68,9 +104,11 @@ impl fmt::Display for SandboxError {
     }
 }
 
+// `Display` is the error source. No extra fields.
 impl std::error::Error for SandboxError {}
 
-/// What the sandbox actually turned on for this process.
+/// Limits recorded on the guard after setup. This is a snapshot, not a new OS call,
+/// except `os_enforced`, which re-runs [`MandatorySandboxGuard::verify_active`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxTelemetry {
     pub backend_name: &'static str,
@@ -84,7 +122,13 @@ pub struct SandboxTelemetry {
     pub contained_tab_faults: u64,
 }
 
-/// Guard held by the browser for the life of the process.
+/// Guard held by `flux-browser` for the life of the window process.
+///
+/// `seal` must stay `SANDBOX_SEAL_TOKEN`. `isolated_executions` counts calls
+/// to [`execute_isolated`](Self::execute_isolated). `contained_faults` counts
+/// workload errors and panics. On Windows `job_handle` is the Job Object for
+/// this process and is closed in `Drop`. Linux has no handle. The guard does
+/// not move tabs into another process.
 #[derive(Debug)]
 pub struct MandatorySandboxGuard {
     seal: u64,
@@ -95,12 +139,15 @@ pub struct MandatorySandboxGuard {
     kill_on_close: bool,
     isolated_executions: u64,
     contained_faults: u64,
+    // Windows only. The Job Object for this process. Linux has no handle field.
     #[cfg(target_os = "windows")]
     job_handle: isize,
 }
 
+// Windows only. Linux has no job handle to close.
 #[cfg(target_os = "windows")]
 impl Drop for MandatorySandboxGuard {
+    /// Close the window Job Object. A zero handle means it was already closed.
     fn drop(&mut self) {
         if self.job_handle != 0 {
             unsafe {
@@ -112,10 +159,17 @@ impl Drop for MandatorySandboxGuard {
 }
 
 impl MandatorySandboxGuard {
-    /// Set up the window-process limits, or return an error.
+    /// Set up window-process limits, or return an error.
+    ///
+    /// Runs the IPC round trip first. Windows assigns the current process to
+    /// the UI job. Linux applies `PR_SET_NO_NEW_PRIVS`, a zero core limit, and
+    /// the 2 GiB attempt. Any other OS returns `OsInitializationFailed`.
+    /// Failure here does not switch the process into `--tab-worker`.
     pub fn initialize_or_fail() -> Result<Self, SandboxError> {
         verify_ipc_self_test()?;
 
+        // Windows window path: memory cap, die-on-unhandled-exception, kill-on-job-close.
+        // No UI restriction class and no active-process cap.
         #[cfg(target_os = "windows")]
         {
             let (job_handle, limit) = create_windows_ui_job()?;
@@ -142,6 +196,7 @@ impl MandatorySandboxGuard {
             })
         }
 
+        // Linux window path: no-new-privs is mandatory. The address cap is best-effort.
         #[cfg(target_os = "linux")]
         {
             let limit = apply_linux_ui_limits()?;
@@ -157,6 +212,7 @@ impl MandatorySandboxGuard {
             })
         }
 
+        // Not Windows and not Linux. The window refuses to start.
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             Err(SandboxError::OsInitializationFailed(
@@ -165,11 +221,12 @@ impl MandatorySandboxGuard {
         }
     }
 
-    /// Verify that this guard is intact and sealed.
+    /// Reject a guard whose seal was overwritten. On Windows a zero job handle also fails.
     pub fn verify_active(&self) -> Result<(), SandboxError> {
         if self.seal != SANDBOX_SEAL_TOKEN {
             return Err(SandboxError::UnverifiedGuard);
         }
+        // Windows: the Job Object must still be open. Linux has no handle field.
         #[cfg(target_os = "windows")]
         if self.job_handle == 0 {
             return Err(SandboxError::UnverifiedGuard);
@@ -177,7 +234,12 @@ impl MandatorySandboxGuard {
         Ok(())
     }
 
-    /// Run `workload` and count a panic instead of letting it escape.
+    /// Run `workload` in this process and count a panic instead of letting it escape.
+    ///
+    /// `catch_unwind` is the isolation. There is no child process and no
+    /// `--tab-worker` launch. `Ok(Ok)` returns the value. `Ok(Err)` and a panic
+    /// both increment `contained_faults` and return `TabIsolatedFault` with
+    /// `tab_label`. The guard must already be sealed.
     pub fn execute_isolated<T, F>(
         &mut self,
         tab_label: &str,
@@ -206,7 +268,11 @@ impl MandatorySandboxGuard {
         }
     }
 
-    /// Report the limits that were actually applied.
+    /// Copy the limits stored on this guard.
+    ///
+    /// `os_enforced` is the current [`verify_active`](Self::verify_active) result.
+    /// `memory_limit_bytes` is whatever setup recorded, which on Linux may be
+    /// lower than 2 GiB. `max_ipc_bytes` is always [`MANDATORY_IPC_MAX_BYTES`].
     pub fn telemetry(&self) -> SandboxTelemetry {
         SandboxTelemetry {
             backend_name: self.backend_name,
@@ -222,7 +288,10 @@ impl MandatorySandboxGuard {
     }
 }
 
-/// Set up sandbox limits, or exit the process.
+/// Set up the window limits, or exit with status 101.
+///
+/// This is what `flux-browser` calls for normal browsing. It does not start a
+/// tab worker. A printed line goes to stderr before the exit.
 pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
     match MandatorySandboxGuard::initialize_or_fail() {
         Ok(guard) => guard,
@@ -233,9 +302,15 @@ pub fn enforce_mandatory_sandbox_or_abort() -> MandatorySandboxGuard {
     }
 }
 
-/// Apply the tighter worker limits. Used by `--tab-worker`.
+/// Apply the tighter `--tab-worker` limits, or exit with status 102.
+///
+/// Called only from the `--tab-worker` branch in `flux-browser`. Ordinary
+/// tabs do not call this and are not spawned into this mode. Windows builds
+/// the worker job (256 MiB, one process, all UI limits). Linux reapplies the
+/// window limits and then requires the 256 MiB address cap.
 pub fn lock_current_worker_process_or_abort() {
     let res: Result<(), SandboxError> = (|| {
+        // Windows worker: memory, process count, and UI limits. The UI mask is not stored.
         #[cfg(target_os = "windows")]
         {
             let (job, _) = create_windows_worker_job()?;
@@ -251,10 +326,12 @@ pub fn lock_current_worker_process_or_abort() {
             }
             Ok(())
         }
+        // Linux worker: no-new-privs, core dumps off, then a required 256 MiB cap.
         #[cfg(target_os = "linux")]
         {
             apply_linux_worker_rlimits()
         }
+        // Not Windows and not Linux. The worker exits via the error below.
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             Err(SandboxError::OsInitializationFailed(
@@ -269,7 +346,11 @@ pub fn lock_current_worker_process_or_abort() {
     }
 }
 
-/// Request message sent over a framed `FLUXIPC1` channel to an isolated tab worker.
+/// JSON object a parent could send to a `--tab-worker` process.
+///
+/// Fields are `tab_id`, `url`, `html`, `scripts_enabled`, and `csp_header`.
+/// Defining this type does not spawn a worker. `flux-browser` reads one of
+/// these only after it was started with `--tab-worker`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerRequest {
     pub tab_id: u64,
@@ -279,7 +360,10 @@ pub struct TabWorkerRequest {
     pub csp_header: Option<String>,
 }
 
-/// Response message returned by an isolated tab worker over a framed `FLUXIPC1` channel.
+/// JSON object a `--tab-worker` process writes back.
+///
+/// Fields are `tab_id`, `ok`, `title`, `dom_nodes`, `blocked_csp_resources`,
+/// and `error`. The window's normal tab path does not exchange these frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerResponse {
     pub tab_id: u64,
@@ -291,6 +375,7 @@ pub struct TabWorkerResponse {
 }
 
 impl TabWorkerRequest {
+    /// Encode the request as a `flux-json` object. A missing CSP header is JSON null.
     pub fn to_json(&self) -> JsonValue {
         let mut obj = JsonValue::empty_object();
         obj.insert("tab_id", JsonValue::Number(self.tab_id as f64));
@@ -304,6 +389,8 @@ impl TabWorkerRequest {
         obj
     }
 
+    /// Read a request. `tab_id`, `url`, and `html` are required.
+    /// `scripts_enabled` defaults to true. `csp_header` is optional.
     pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
         let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
             "missing tab_id in worker request",
@@ -333,6 +420,7 @@ impl TabWorkerRequest {
 }
 
 impl TabWorkerResponse {
+    /// Encode the response as a `flux-json` object. A missing error is JSON null.
     pub fn to_json(&self) -> JsonValue {
         let mut obj = JsonValue::empty_object();
         obj.insert("tab_id", JsonValue::Number(self.tab_id as f64));
@@ -350,6 +438,8 @@ impl TabWorkerResponse {
         obj
     }
 
+    /// Read a response. `tab_id` and `ok` are required.
+    /// `title` defaults to "Untitled". Counts default to 0. `error` is optional.
     pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
         let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
             "missing tab_id in worker response",
@@ -372,8 +462,10 @@ impl TabWorkerResponse {
     }
 }
 
-/// Encode a `JsonValue` into a length-prefixed `FLUXIPC1` wire frame bounded by
-/// [`MANDATORY_IPC_MAX_BYTES`].
+/// Serialize `payload` with `flux-json` and wrap it as `FLUXIPC1` + u32le length + bytes.
+///
+/// The length is the JSON body only. A body larger than [`MANDATORY_IPC_MAX_BYTES`]
+/// is `IpcPayloadTooLarge` and is not framed.
 pub fn encode_ipc_frame(payload: &JsonValue) -> Result<Vec<u8>, SandboxError> {
     let serialized = to_json_string(payload);
     let bytes = serialized.as_bytes();
@@ -387,7 +479,11 @@ pub fn encode_ipc_frame(payload: &JsonValue) -> Result<Vec<u8>, SandboxError> {
     Ok(frame)
 }
 
-/// Decode and validate a length-prefixed `FLUXIPC1` wire frame using bounded JSON parsing.
+/// Check magic, length, and UTF-8, then parse with `flux-json`'s bounded parser.
+///
+/// The frame must be exactly 12 + declared length bytes. The declared length
+/// may not exceed [`MANDATORY_IPC_MAX_BYTES`]. Nesting may not exceed
+/// [`MANDATORY_IPC_MAX_JSON_DEPTH`].
 pub fn decode_ipc_frame(frame: &[u8]) -> Result<JsonValue, SandboxError> {
     if frame.len() < 12 {
         return Err(SandboxError::IpcFramingError(
@@ -412,7 +508,10 @@ pub fn decode_ipc_frame(frame: &[u8]) -> Result<JsonValue, SandboxError> {
         .map_err(|_| SandboxError::IpcFramingError("malformed or over-nested IPC JSON"))
 }
 
-/// Write an IPC frame to a stream (such as a child worker's `stdin` or `stdout` pipe).
+/// Write one frame and flush. A short write is `IpcFramingError`.
+///
+/// The `--tab-worker` process uses this on stdout. The window does not call it
+/// during normal browsing.
 pub fn write_ipc_frame<W: Write>(writer: &mut W, payload: &JsonValue) -> Result<(), SandboxError> {
     let frame = encode_ipc_frame(payload)?;
     writer
@@ -421,7 +520,10 @@ pub fn write_ipc_frame<W: Write>(writer: &mut W, payload: &JsonValue) -> Result<
         .map_err(|_| SandboxError::IpcFramingError("failed to write IPC frame"))
 }
 
-/// Read an IPC frame from a stream with strict header and length validation before allocation.
+/// Read a 12-byte header, reject a bad magic or an overlong body, then read exactly that body.
+///
+/// The body buffer is sized from the declared length only after the cap check,
+/// so a huge length does not allocate. The bytes then go through [`decode_ipc_frame`].
 pub fn read_ipc_frame<R: Read>(reader: &mut R) -> Result<JsonValue, SandboxError> {
     let mut header = [0_u8; 12];
     reader
@@ -445,6 +547,10 @@ pub fn read_ipc_frame<R: Read>(reader: &mut R) -> Result<JsonValue, SandboxError
     decode_ipc_frame(&frame)
 }
 
+/// Encode and decode one fixed request before OS limits are applied.
+///
+/// A mismatch is `OsInitializationFailed`, so a broken framer stops startup.
+/// This does not talk to another process.
 fn verify_ipc_self_test() -> Result<(), SandboxError> {
     let req = TabWorkerRequest {
         tab_id: 1,
@@ -464,26 +570,33 @@ fn verify_ipc_self_test() -> Result<(), SandboxError> {
     Ok(())
 }
 
-// ============================================================================
-// Windows Native Job Object & UI Restriction Sandbox (kernel32.dll)
-// ============================================================================
+// Windows only. kernel32 Job Object for the window process and for `--tab-worker`.
+// The window job does not set UI restrictions. The worker job does.
 #[cfg(target_os = "windows")]
+/// `JobObjectBasicUIRestrictions` information class (4). Worker job only.
 const JOB_OBJECT_BASIC_UI_RESTRICTIONS: i32 = 4;
 #[cfg(target_os = "windows")]
+/// `JobObjectExtendedLimitInformation` information class (9). Both jobs.
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
 
 #[cfg(target_os = "windows")]
+/// Limit flag: cap how many processes the job may hold. Worker job only.
 const JOB_OBJECT_LIMIT_ACTIVE_PROCESS: u32 = 0x0000_0008;
 #[cfg(target_os = "windows")]
+/// Limit flag: `ProcessMemoryLimit` is in bytes. Both jobs.
 const JOB_OBJECT_LIMIT_PROCESS_MEMORY: u32 = 0x0000_0100;
 #[cfg(target_os = "windows")]
+/// Limit flag: an unhandled exception ends the process. Both jobs.
 const JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION: u32 = 0x0000_0400;
 #[cfg(target_os = "windows")]
+/// Limit flag: closing the last job handle kills assigned processes. Both jobs.
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
 
 #[cfg(target_os = "windows")]
+/// All basic UI restriction bits (0xFF). Clipboard, desktop, handles, and exits. Worker only.
 const JOB_OBJECT_UILIMIT_ALL: u32 = 0x0000_00FF;
 
+/// `JOBOBJECT_BASIC_LIMIT_INFORMATION`. Only `limit_flags` and `active_process_limit` are set.
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -499,6 +612,7 @@ struct JobObjectBasicLimitInformation {
     scheduling_class: u32,
 }
 
+/// `IO_COUNTERS`. Present so the extended struct matches the Windows layout. Left zero.
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -511,6 +625,7 @@ struct IoCounters {
     other_transfer_count: u64,
 }
 
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`. `process_memory_limit` is the cap in bytes.
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -523,6 +638,7 @@ struct JobObjectExtendedLimitInformation {
     peak_job_memory_used: usize,
 }
 
+/// `JOBOBJECT_BASIC_UI_RESTRICTIONS`. One `u32` class mask. Worker job only.
 #[cfg(target_os = "windows")]
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -530,21 +646,28 @@ struct JobObjectBasicUiRestrictions {
     ui_restrictions_class: u32,
 }
 
+// kernel32 job calls. Handles are `isize`. A zero return is failure.
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    /// Anonymous job. Both pointers are null. There is no job name.
     fn CreateJobObjectW(security_attributes: *const core::ffi::c_void, name: *const u16) -> isize;
+    /// Writes either extended limits or basic UI restrictions, selected by `info_class`.
     fn SetInformationJobObject(
         job: isize,
         info_class: i32,
         info: *const core::ffi::c_void,
         info_length: u32,
     ) -> i32;
+    /// Puts `process` into `job`. The window and the worker each assign themselves.
     fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+    /// Pseudo-handle of this process. Not closed.
     fn GetCurrentProcess() -> isize;
+    /// Closes a job handle. Used on failure and when the guard is dropped.
     fn CloseHandle(handle: isize) -> i32;
 }
 
+/// Apply extended limits. On failure the job handle is closed and an error is returned.
 #[cfg(target_os = "windows")]
 fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result<(), SandboxError> {
     let ok = unsafe {
@@ -566,6 +689,9 @@ fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result
     Ok(())
 }
 
+/// Window job: 2 GiB process memory, die on unhandled exception, kill when the job closes.
+///
+/// No active-process limit and no UI restriction class. Returns the handle and the byte cap.
 #[cfg(target_os = "windows")]
 fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -583,6 +709,10 @@ fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
     Ok((job, UI_ADDRESS_SPACE_LIMIT_BYTES))
 }
 
+/// Worker job: one active process, 256 MiB, the same kill flags, then all UI limits.
+///
+/// Returns the handle and `JOB_OBJECT_UILIMIT_ALL`. The caller discards the mask.
+/// A failed UI call closes the job. This is not used for normal browsing.
 #[cfg(target_os = "windows")]
 fn create_windows_worker_job() -> Result<(isize, u32), SandboxError> {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -622,16 +752,18 @@ fn create_windows_worker_job() -> Result<(isize, u32), SandboxError> {
     Ok((job, JOB_OBJECT_UILIMIT_ALL))
 }
 
-// ============================================================================
-// Linux Native prctl(PR_SET_NO_NEW_PRIVS) & setrlimit Sandbox (libc)
-// ============================================================================
+// Linux only. prctl and setrlimit. Windows uses the Job Object above instead.
 #[cfg(target_os = "linux")]
+/// `prctl` option. Arg2 = 1 locks out new privileges for this process.
 const PR_SET_NO_NEW_PRIVS: i32 = 38;
 #[cfg(target_os = "linux")]
+/// Resource id for core dumps. Set to zero so a crash does not write a core.
 const RLIMIT_CORE: i32 = 4;
 #[cfg(target_os = "linux")]
+/// Resource id for address space. The cap is in bytes.
 const RLIMIT_AS: i32 = 9;
 
+/// `rlimit`. `rlim_cur` is the soft limit. `rlim_max` is the hard ceiling.
 #[cfg(target_os = "linux")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -640,16 +772,26 @@ struct RLimit {
     rlim_max: usize,
 }
 
+// libc calls. A non-zero return is failure. errno is not read.
 #[cfg(target_os = "linux")]
 #[link(name = "c")]
 unsafe extern "C" {
+    /// Used only as `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)`.
     fn prctl(option: i32, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> i32;
+    /// Reads the current soft and hard limit for one resource.
     fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+    /// Writes a soft and hard limit. The hard limit is not raised.
     fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
 }
 
+/// Try to lower `RLIMIT_AS` to `bytes` without raising either side.
+///
+/// Returns the soft limit that is in effect afterward. `getrlimit` failure
+/// returns 0. `setrlimit` failure returns the previous soft limit. `RLIM_INFINITY`
+/// is `usize::MAX` and is replaced rather than kept when it is the hard limit.
 #[cfg(target_os = "linux")]
 fn cap_address_space(bytes: usize) -> usize {
+    /// `RLIM_INFINITY` on this platform.
     const INFINITY: usize = usize::MAX;
     let mut current = RLimit {
         rlim_cur: 0,
@@ -680,6 +822,10 @@ fn cap_address_space(bytes: usize) -> usize {
     }
 }
 
+/// Window limits. `PR_SET_NO_NEW_PRIVS` must succeed.
+///
+/// Core dumps are set to zero and a failure there is ignored. The 2 GiB
+/// address cap is best-effort: the returned value may be 0 or the old soft limit.
 #[cfg(target_os = "linux")]
 fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
     let rc = unsafe { prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -696,6 +842,10 @@ fn apply_linux_ui_limits() -> Result<usize, SandboxError> {
     Ok(cap_address_space(UI_ADDRESS_SPACE_LIMIT_BYTES))
 }
 
+/// Worker limits. Runs the window limits, then requires a soft cap at or under 256 MiB.
+///
+/// `applied == 0` or a cap still above 256 MiB is a hard error. The caller exits.
+/// Normal browsing does not call this.
 #[cfg(target_os = "linux")]
 fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     apply_linux_ui_limits()?;
@@ -708,6 +858,7 @@ fn apply_linux_worker_rlimits() -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Window-guard startup, panic accounting, and one IPC round trip. No child process.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,8 +873,10 @@ mod tests {
         assert!(telemetry.os_enforced);
         assert_eq!(telemetry.active_process_limit, 0);
         assert_eq!(telemetry.ui_restrictions_mask, 0);
+        // Linux window job is not kill-on-close. There is no job handle.
         #[cfg(target_os = "linux")]
         assert!(!telemetry.kill_on_close);
+        // Windows window job sets JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
         #[cfg(target_os = "windows")]
         assert!(telemetry.kill_on_close);
 

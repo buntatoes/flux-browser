@@ -1,7 +1,15 @@
 //! Built-in `flux://` pages.
 //!
-//! The `.tsx` files under `frontend/` are stored as text. A few replacements
-//! turn them into HTML for the page parser.
+//! `Session::open_target` in `lib.rs` calls the page builders. `load_target`
+//! calls `resolve_builtin_page` and `resolve_navigation_query`. `ui.rs` is used
+//! for `normalize_address_input_with_engine`. `flux-dom::parse_html` parses the
+//! shell string in `render_react_shell_document`. `flux-video::GpuVideoSession`
+//! only supplies the default backend label for the inspect and settings snapshots.
+//!
+//! `frontend/App.tsx`, `frontend/components/*.tsx`, `frontend/styles/browser.css`,
+//! and `frontend/scripts/*.js` are stored as text. `compile_tsx_component` copies
+//! the `return (` body and replaces `{props.name}`, `={{props.name}}`, `{{SLOT}}`,
+//! and `className=` with `class=`. There is no component compiler and no Node build.
 
 use flux_dom::{Document, parse_html};
 use flux_video::GpuVideoSession;
@@ -10,47 +18,71 @@ use crate::downloads::DownloadEntry;
 use crate::ui::{UiState, normalize_address_input_with_engine};
 use crate::{Bookmark, SearchEngine, Session, VERSION};
 
+/// Canonical URL for the start page.
 pub const HOME_URL: &str = "flux://home";
+/// Canonical URL for the inspector page.
 pub const INSPECT_URL: &str = "flux://inspect";
+/// Canonical URL for the security page.
 pub const SECURITY_URL: &str = "flux://security";
+/// Canonical URL for the settings page.
 pub const SETTINGS_URL: &str = "flux://settings";
+/// Canonical URL for the history page.
 pub const HISTORY_URL: &str = "flux://history";
+/// Canonical URL for the downloads page.
 pub const DOWNLOADS_URL: &str = "flux://downloads";
+/// Prefix for the in-page navigation form. The query key is `q`.
 pub const NAVIGATE_URL_PREFIX: &str = "flux://navigate";
 
-/// Embedded React/TSX root browser shell component (`frontend/App.tsx`).
+/// Text of `frontend/App.tsx`. The shell page fills its `return (` body.
 pub const APP_TSX: &str = include_str!("../../../frontend/App.tsx");
 
-/// Embedded React/TSX start dashboard component (`frontend/components/StartDashboard.tsx`).
+/// Text of `frontend/components/StartDashboard.tsx`.
 pub const START_DASHBOARD_TSX: &str =
     include_str!("../../../frontend/components/StartDashboard.tsx");
 
-/// Embedded React/TSX developer inspector component (`frontend/components/InspectorPage.tsx`).
+/// Text of `frontend/components/InspectorPage.tsx`.
 pub const INSPECTOR_PAGE_TSX: &str = include_str!("../../../frontend/components/InspectorPage.tsx");
 
-/// Embedded React/TSX security center component (`frontend/components/SecurityCenter.tsx`).
+/// Text of `frontend/components/SecurityCenter.tsx`.
 pub const SECURITY_CENTER_TSX: &str =
     include_str!("../../../frontend/components/SecurityCenter.tsx");
 
-/// Embedded React/TSX settings & GPU video component (`frontend/components/SettingsPage.tsx`).
+/// Text of `frontend/components/SettingsPage.tsx`.
 pub const SETTINGS_PAGE_TSX: &str = include_str!("../../../frontend/components/SettingsPage.tsx");
 
-/// Embedded React/TSX browsing history component (`frontend/components/HistoryPage.tsx`).
+/// Text of `frontend/components/HistoryPage.tsx`.
 pub const HISTORY_PAGE_TSX: &str = include_str!("../../../frontend/components/HistoryPage.tsx");
 
-/// Embedded React/TSX download manager component (`frontend/components/DownloadsPage.tsx`).
+/// Text of `frontend/components/DownloadsPage.tsx`.
 pub const DOWNLOADS_PAGE_TSX: &str = include_str!("../../../frontend/components/DownloadsPage.tsx");
 
 /// Embedded stylesheet (`frontend/styles/browser.css`).
 pub const BROWSER_CSS: &str = include_str!("../../../frontend/styles/browser.css");
 
-/// Embedded JavaScript home screen controller (`frontend/scripts/home.js`).
+/// Shared front-end controller utilities (`frontend/scripts/flux_core.js`).
+pub const FLUX_CORE_JS: &str = include_str!("../../../frontend/scripts/flux_core.js");
+
+/// Text of `frontend/scripts/home.js`, inserted as a script on the start page.
 pub const HOME_JS: &str = include_str!("../../../frontend/scripts/home.js");
 
-/// Embedded JavaScript settings controller (`frontend/scripts/settings.js`).
+/// Text of `frontend/scripts/settings.js`, inserted as a script on the settings page.
 pub const SETTINGS_JS: &str = include_str!("../../../frontend/scripts/settings.js");
 
-/// Extract the JSX markup inside a TSX component's `return ( ... );` block.
+/// Text of `frontend/scripts/inspect.js`, inserted as a script on the inspector page.
+pub const INSPECT_JS: &str = include_str!("../../../frontend/scripts/inspect.js");
+
+/// Text of `frontend/scripts/security.js`, inserted as a script on the security page.
+pub const SECURITY_JS: &str = include_str!("../../../frontend/scripts/security.js");
+
+/// Text of `frontend/scripts/downloads.js`, inserted as a script on the downloads page.
+pub const DOWNLOADS_JS: &str = include_str!("../../../frontend/scripts/downloads.js");
+
+/// Text of `frontend/scripts/history.js`, inserted as a script on the history page.
+pub const HISTORY_JS: &str = include_str!("../../../frontend/scripts/history.js");
+
+/// Slice between the first `return (` and the last `);`.
+///
+/// If `return (` is missing, the whole source is returned. This is a string slice, not a parse.
 pub fn extract_tsx_return_body(tsx_source: &str) -> &str {
     let Some(ret_idx) = tsx_source.find("return (") else {
         return tsx_source;
@@ -62,7 +94,10 @@ pub fn extract_tsx_return_body(tsx_source: &str) -> &str {
     after_ret[..end_idx].trim()
 }
 
-/// Compile a TSX component source into HTML by binding `props` and converting JSX attributes.
+/// Replace prop and slot tokens in the `return (` body, then turn `className=` into `class=`.
+///
+/// `props` replaces `{props.NAME}` and `={{props.NAME}}`. `slots` replaces `{{NAME}}`.
+/// No other syntax is interpreted.
 pub fn compile_tsx_component(
     tsx_source: &str,
     props: &[(&str, &str)],
@@ -146,14 +181,19 @@ pub fn urlencode_component(input: &str) -> String {
     out
 }
 
-/// Intercept internal `flux://navigate?q=...` form submissions and resolve the destination URL
-/// using the Default `Google` search engine.
+/// Resolve `flux://navigate?q=...` with `SearchEngine::Google`.
+///
+/// `Session::open_target` does not use this. It calls `resolve_navigation_query_with_engine`
+/// with the engine stored in settings. `load_target` does call this function.
 pub fn resolve_navigation_query(target: &str) -> Option<String> {
     resolve_navigation_query_with_engine(target, SearchEngine::Google)
 }
 
-/// Intercept internal `flux://navigate?q=...` form submissions and resolve the destination URL
-/// or format a search query for `engine` (`Google`, `DuckDuckGo`, or `Microsoft Bing`).
+/// Resolve `flux://navigate?q=...` for `engine`.
+///
+/// An empty `q` returns that engine's home URL. Other text goes through
+/// `normalize_address_input_with_engine`. Google Search, DuckDuckGo, and
+/// Microsoft Bing are the three `SearchEngine` values.
 pub fn resolve_navigation_query_with_engine(target: &str, engine: SearchEngine) -> Option<String> {
     let trimmed = target.trim();
     let rest = trimmed.strip_prefix(NAVIGATE_URL_PREFIX)?;
@@ -211,12 +251,14 @@ pub fn resolve_builtin_page(target: &str) -> Option<(String, String)> {
     }
 }
 
-/// Built-in `flux://home` solid blank home screen compiled from `frontend/components/StartDashboard.tsx`.
+/// Start page HTML for Google Search. Calls `home_html_with_engine`.
 pub fn home_html() -> String {
     home_html_with_engine(SearchEngine::Google)
 }
 
-/// Built-in `flux://home` solid blank home screen with the selected search engine (`Google`, `DuckDuckGo`, `Bing`).
+/// Start page HTML for `engine`, including `browser.css`, `flux_core.js`, and `home.js`.
+///
+/// The engine mark is a `flux://engine-*.png` URL. `lib.rs` draws that URL later.
 pub fn home_html_with_engine(engine: SearchEngine) -> String {
     let placeholder = format!("Search {} or enter web address...", engine.label());
     let engine_logo = match engine {
@@ -236,11 +278,11 @@ pub fn home_html_with_engine(engine: SearchEngine) -> String {
         &[],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Start</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{HOME_JS}\n  </script>\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Start</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{HOME_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Built-in `flux://inspect` developer inspector compiled from `frontend/components/InspectorPage.tsx`.
+/// Inspector page HTML filled with the counts passed in, plus `flux_core.js` and `inspect.js`.
 #[allow(clippy::too_many_arguments)]
 pub fn inspect_html_with_state(
     tab_count: usize,
@@ -272,25 +314,25 @@ pub fn inspect_html_with_state(
         &[],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Developer Inspector</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Developer Inspector</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{INSPECT_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Default `flux://inspect` HTML snapshot.
+/// Inspector HTML with placeholder counts and the default `GpuVideoSession` backend label.
 pub fn inspect_html() -> String {
     let gpu = GpuVideoSession::default();
     inspect_html_with_state(1, 100, gpu.backend().label(), 0, 5, 0, 0)
 }
 
-/// Built-in `flux://security` dashboard compiled from `frontend/components/SecurityCenter.tsx`.
+/// Security page HTML with `flux_core.js` and `security.js`.
 pub fn security_html() -> String {
     let body = compile_tsx_component(SECURITY_CENTER_TSX, &[("version", VERSION)], &[]);
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Security Center</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Security Center</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{SECURITY_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Built-in `flux://settings` page compiled from `frontend/components/SettingsPage.tsx`.
+/// Settings HTML with scripts and JIT shown as enabled and Google Search selected.
 pub fn settings_html_with_state(
     gpu_backend_label: &str,
     gpu_video_enabled: bool,
@@ -314,7 +356,7 @@ pub fn settings_html_with_state(
     )
 }
 
-/// Built-in `flux://settings` page with live encrypted profile telemetry.
+/// Settings HTML with bookmark, history, and cookie counts. JIT stays enabled and the engine is Google Search.
 #[allow(clippy::too_many_arguments)]
 pub fn settings_html_with_profile_state(
     gpu_backend_label: &str,
@@ -342,7 +384,11 @@ pub fn settings_html_with_profile_state(
     )
 }
 
-/// Built-in `flux://settings` page with live search engine, JavaScript JIT, and encrypted profile telemetry.
+/// Settings HTML for the given toggles, engine, frame counters, and profile counts.
+///
+/// The profile status line inserted into the page is a fixed string. It is not
+/// read back from `profile.flx`. The GPU status text says frames are decoded on
+/// the CPU when the toggle is on. `flux_core.js` and `settings.js` are included as a script tag.
 #[allow(clippy::too_many_arguments)]
 pub fn settings_html_with_profile_state_and_engine(
     gpu_backend_label: &str,
@@ -358,17 +404,9 @@ pub fn settings_html_with_profile_state_and_engine(
     cookie_count: usize,
 ) -> String {
     let (gpu_status, gpu_toggle_label, gpu_toggle_cls) = if gpu_video_enabled {
-        (
-            "On. Frames are decoded on the CPU.",
-            "On",
-            "toggle-pill-on",
-        )
+        ("On. Frames are decoded on the CPU.", "On", "toggle-pill-on")
     } else {
-        (
-            "Off.",
-            "Off",
-            "toggle-pill-off",
-        )
+        ("Off.", "Off", "toggle-pill-off")
     };
     let (https_status, https_toggle_label, https_toggle_cls) = if https_only {
         (
@@ -461,11 +499,11 @@ pub fn settings_html_with_profile_state_and_engine(
         &[],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Settings</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{SETTINGS_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Default `flux://settings` HTML snapshot using default `GpuVideoSession` state.
+/// Settings HTML from a default `GpuVideoSession`, with placeholder frame counts of 12.
 pub fn settings_html() -> String {
     let session = GpuVideoSession::default();
     settings_html_with_state(
@@ -478,7 +516,7 @@ pub fn settings_html() -> String {
     )
 }
 
-/// Built-in `flux://history` page compiled from `frontend/components/HistoryPage.tsx`.
+/// History page HTML. Entries are escaped and listed newest first. Includes `flux_core.js` and `history.js`.
 pub fn history_html_with_entries(entries: &[Bookmark]) -> String {
     let count_str = entries.len().to_string();
     let mut items_html = String::new();
@@ -502,16 +540,16 @@ pub fn history_html_with_entries(entries: &[Bookmark]) -> String {
         &[("HISTORY_ITEMS_SLOT", &items_html)],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux History</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux History</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{HISTORY_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Default `flux://history` HTML snapshot.
+/// History page HTML with no entries.
 pub fn history_html() -> String {
     history_html_with_entries(&[])
 }
 
-/// Built-in `flux://downloads` page compiled from `frontend/components/DownloadsPage.tsx`.
+/// Downloads page HTML. Entries are escaped and listed newest first. Includes `flux_core.js` and `downloads.js`.
 pub fn downloads_html_with_entries(entries: &[DownloadEntry]) -> String {
     let count_str = entries.len().to_string();
     let mut items_html = String::new();
@@ -544,16 +582,19 @@ pub fn downloads_html_with_entries(entries: &[DownloadEntry]) -> String {
         &[("DOWNLOAD_ITEMS_SLOT", &items_html)],
     );
     format!(
-        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Downloads</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n</body>\n</html>"
+        "<!DOCTYPE html>\n<html>\n<head>\n  <title>Flux Downloads</title>\n  <style>\n{BROWSER_CSS}\n  </style>\n</head>\n<body>\n{body}\n  <script>\n{FLUX_CORE_JS}\n{DOWNLOADS_JS}\n  </script>\n</body>\n</html>"
     )
 }
 
-/// Default `flux://downloads` HTML snapshot.
+/// Downloads page HTML with no entries.
 pub fn downloads_html() -> String {
     downloads_html_with_entries(&[])
 }
 
-/// Compile the full React/TSX browser shell (`frontend/App.tsx`) for the current `Session` and `UiState`.
+/// Fill `frontend/App.tsx` text from `session` and `ui`.
+///
+/// The function name is historical. The return value is an HTML string. The
+/// viewport slot is left empty. `shell` and `ui` paint the page separately.
 pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     let active_idx = session.active_index();
     let tab_count = session.tabs().len();
@@ -594,7 +635,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     let active_url = session
         .active()
         .current()
-        .map(|p| p.source.as_str())
+        .map(|p| p.url.as_str())
         .unwrap_or(HOME_URL);
 
     let (sec_label, sec_class) = if active_url.starts_with("https://") {
@@ -671,8 +712,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
         format!("Ready — {}", escape_html(active_url))
     };
 
-    let status_right =
-        format!("Flux {VERSION}");
+    let status_right = format!("Flux {VERSION}");
 
     let body = compile_tsx_component(
         APP_TSX,
@@ -706,7 +746,7 @@ pub fn render_react_shell_html(session: &Session, ui: &UiState) -> String {
     )
 }
 
-/// Compile `frontend/App.tsx` and parse it into a native `flux_dom::Document`.
+/// Parse `render_react_shell_html` with `flux-dom`. This does not run scripts.
 pub fn render_react_shell_document(session: &Session, ui: &UiState) -> Document {
     let html = render_react_shell_html(session, ui);
     parse_html(&html)
@@ -714,9 +754,11 @@ pub fn render_react_shell_document(session: &Session, ui: &UiState) -> Document 
 
 #[cfg(test)]
 mod tests {
+    //! Checks that the text replacements remove `className=` and leave the expected element ids.
     use super::*;
 
     #[test]
+    /// The text replacement removes `className=` and leaves the expected element ids.
     fn compiles_react_tsx_shell_and_builtin_dashboards_into_dom() {
         let home = home_html();
         assert!(home.contains("Google Search"));

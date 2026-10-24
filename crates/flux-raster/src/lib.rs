@@ -1,27 +1,47 @@
-//! Software rasterizer for display lists.
+//! CPU RGBA framebuffer and signed-distance rasterizer.
 //!
-//! Draws into a top-down RGBA framebuffer. On Linux, text comes from a system
-//! `.ttf` through `flux-ttf` when one is installed. Otherwise it falls back to
-//! a built-in 5x7 bitmap font. Windows tries GDI first.
+//! `flux-browser` calls [`rasterize`] with a `flux-paint` display list, then
+//! blits the pixels into the window. The buffer is top-down RGBA8 in this
+//! process. Nothing here uploads a draw to a GPU.
+//!
+//! Rounded boxes, box shadows, and linear gradients call the C++20 scanline
+//! and compositor helpers when `flux_cpp_accel` is linked, or fall back to the
+//! CPU helpers in `flux-gpu` (`sdf_rounded_box`, `sdf_box_shadow_alpha`, and
+//! `sample_linear_gradient`). Images are `flux-image` buffers. `draw_image`
+//! resizes with that crate's bilinear filter and samples the result. This
+//! crate does not call `flux-video`. A video frame is drawn only after the
+//! browser has already copied the surface into an `Image` on the display list.
+//!
+//! Text on Windows tries Win32 GDI in `font` and, if that returns false, the
+//! built-in 5x7 bitmap. Text on Linux loads DejaVu Sans or Liberation Sans
+//! through `flux-ttf` when one of those files parses. Otherwise the same
+//! bitmap font is used.
 
+// Windows only. GDI text. Linux does not compile this module.
 #[cfg(windows)]
 mod font;
 
+#[cfg(not(flux_cpp_accel))]
 use flux_gpu::{GpuColor, sample_linear_gradient, sdf_box_shadow_alpha, sdf_rounded_box};
 use flux_image::Image;
 use flux_paint::{DisplayItem, DisplayList};
 pub use flux_style::Color;
 use flux_ttf::TtfFont;
 
+/// Scanline and compositor entry points from `flux_raster_accel.cpp` and
+/// `flux_raster_compositor.cpp`. Present only when `build.rs` set `flux_cpp_accel`.
 #[cfg(flux_cpp_accel)]
 unsafe extern "C" {
+    /// Must return 16 or [`is_cpp_raster_kernel_active`] reports the kernel as off.
     fn flux_cpp_raster_kernel_version() -> u32;
+    /// Top-down RGBA to bottom-up BGRA. Used by [`Framebuffer::to_bgra_bottom_up`].
     fn flux_cpp_rgba_to_bgra_bottom_up(
         src_rgba: *const u8,
         dst_bgra: *mut u8,
         width: u32,
         height: u32,
     );
+    /// Opaque or blended axis-aligned fill. The clip stack is applied in Rust first.
     fn flux_cpp_fill_rect_rgba(
         pixels: *mut u8,
         fb_width: u32,
@@ -35,6 +55,7 @@ unsafe extern "C" {
         b: u8,
         a: u8,
     );
+    /// Rounded fill plus optional border. Its SDF is local to the C++ file.
     fn flux_cpp_fill_rounded_rect_sdf(
         pixels: *mut u8,
         fb_width: u32,
@@ -58,10 +79,102 @@ unsafe extern "C" {
         border_b: u8,
         border_a: u8,
     );
+    /// Analytical SDF box-shadow scanline pass.
+    fn flux_cpp_fill_box_shadow_sdf(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        cx: f32,
+        cy: f32,
+        half_w: f32,
+        half_h: f32,
+        radius: f32,
+        blur: f32,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    );
+    /// Rounded-rect two-stop linear gradient scanline pass.
+    fn flux_cpp_fill_linear_gradient_sdf(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        radius: f32,
+        border_width: f32,
+        angle_deg: f32,
+        start_r: u8,
+        start_g: u8,
+        start_b: u8,
+        start_a: u8,
+        end_r: u8,
+        end_g: u8,
+        end_b: u8,
+        end_a: u8,
+        border_r: u8,
+        border_g: u8,
+        border_b: u8,
+        border_a: u8,
+    );
+    /// 8-bit coverage glyph bitmap blender.
+    fn flux_cpp_blend_glyph_coverage(
+        pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        clip_x0: i32,
+        clip_y0: i32,
+        clip_x1: i32,
+        clip_y1: i32,
+        dst_x: i32,
+        dst_y: i32,
+        coverage: *const u8,
+        glyph_w: u32,
+        glyph_h: u32,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    );
+    /// Clipped RGBA image blitter with optional rounded-corner SDF mask.
+    fn flux_cpp_blit_rgba_clipped(
+        dst_pixels: *mut u8,
+        fb_width: u32,
+        fb_height: u32,
+        clip_x0: i32,
+        clip_y0: i32,
+        clip_x1: i32,
+        clip_y1: i32,
+        base_x: i32,
+        base_y: i32,
+        src_rgba: *const u8,
+        src_w: u32,
+        src_h: u32,
+        border_radius: f32,
+    );
+    /// Semi-planar NV12 (Y + UV) to RGBA8 BT.709 color conversion.
+    fn flux_cpp_nv12_to_rgba_bt709(
+        y_plane: *const u8,
+        uv_plane: *const u8,
+        dst_rgba: *mut u8,
+        width: u32,
+        height: u32,
+    );
 }
 
-/// Returns `true` when the native C++20 rasterization acceleration kernel (`flux_raster_accel.cpp`)
-/// is linked and active.
+/// `true` only when `flux_raster_accel.cpp` is linked and its version symbol is 16.
+/// A build that skipped the compiler returns `false`.
 pub fn is_cpp_raster_kernel_active() -> bool {
     #[cfg(flux_cpp_accel)]
     {
@@ -73,6 +186,57 @@ pub fn is_cpp_raster_kernel_active() -> bool {
     }
 }
 
+/// Convert a semi-planar `NV12` (`Y` plane + interleaved `UV` plane) surface into top-down `RGBA8`
+/// using BT.709 coefficients (accelerated via C++20 when `flux_cpp_accel` is linked).
+pub fn convert_nv12_to_rgba_bt709(
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let uv_stride = ((width as usize) + 1) & !1;
+    let uv_required = ((height as usize).div_ceil(2)).saturating_mul(uv_stride);
+    if width == 0 || height == 0 || y_plane.len() < pixel_count || uv_plane.len() < uv_required {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; pixel_count * 4];
+    #[cfg(flux_cpp_accel)]
+    unsafe {
+        flux_cpp_nv12_to_rgba_bt709(
+            y_plane.as_ptr(),
+            uv_plane.as_ptr(),
+            out.as_mut_ptr(),
+            width,
+            height,
+        );
+        return out;
+    }
+    #[cfg(not(flux_cpp_accel))]
+    {
+        for py in 0..(height as usize) {
+            let uv_row = (py / 2) * uv_stride;
+            for px in 0..(width as usize) {
+                let y_val = i32::from(y_plane[py * (width as usize) + px]);
+                let uv_idx = uv_row + (px & !1);
+                let u_val = i32::from(uv_plane[uv_idx]) - 128;
+                let v_val = i32::from(uv_plane[uv_idx + 1]) - 128;
+                let c = (y_val - 16).max(0) * 298;
+                let r = ((c + 459 * v_val + 128) >> 8).clamp(0, 255) as u8;
+                let g = ((c - 55 * u_val - 136 * v_val + 128) >> 8).clamp(0, 255) as u8;
+                let b = ((c + 541 * u_val + 128) >> 8).clamp(0, 255) as u8;
+                let idx = (py * (width as usize) + px) * 4;
+                out[idx] = r;
+                out[idx + 1] = g;
+                out[idx + 2] = b;
+                out[idx + 3] = 255;
+            }
+        }
+        out
+    }
+}
+
+/// Clear color when the display list does not start with a full-width background rect.
 const PAPER: Color = Color {
     r: 255,
     g: 255,
@@ -80,6 +244,7 @@ const PAPER: Color = Color {
     a: 255,
 };
 
+/// Top-down RGBA8 buffer plus a clip stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Framebuffer {
     width: u32,
@@ -89,6 +254,7 @@ pub struct Framebuffer {
 }
 
 impl Framebuffer {
+    /// Allocate `width * height` pixels filled with `clear`. The clip stack starts empty.
     pub fn new(width: u32, height: u32, clear: Color) -> Self {
         let count = (width as usize).saturating_mul(height as usize);
         let mut pixels = Vec::with_capacity(count * 4);
@@ -103,6 +269,7 @@ impl Framebuffer {
         }
     }
 
+    /// Intersect a new clip with the framebuffer and with the clip already on top.
     pub fn push_clip(&mut self, x: f32, y: f32, width: f32, height: f32) {
         let mut x0 = (x.floor() as i32).max(0);
         let mut y0 = (y.floor() as i32).max(0);
@@ -117,22 +284,27 @@ impl Framebuffer {
         self.clips.push((x0, y0, x1, y1));
     }
 
+    /// Drop the top clip. A pop on an empty stack does nothing.
     pub fn pop_clip(&mut self) {
         self.clips.pop();
     }
 
+    /// Buffer width in pixels.
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    /// Buffer height in pixels.
     pub fn height(&self) -> u32 {
         self.height
     }
 
+    /// Raw top-down RGBA bytes. Length is `width * height * 4`.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
+    /// Read one pixel. `None` when `x` or `y` is outside the buffer. Clips are ignored.
     pub fn pixel(&self, x: u32, y: u32) -> Option<Color> {
         if x >= self.width || y >= self.height {
             return None;
@@ -146,6 +318,7 @@ impl Framebuffer {
         })
     }
 
+    /// Blend `color` at an integer pixel.
     pub fn set_pixel(&mut self, x: i32, y: i32, color: Color) {
         if x < 0 || y < 0 || color.a == 0 {
             return;
@@ -178,6 +351,7 @@ impl Framebuffer {
         self.pixels[offset + 3] = 255;
     }
 
+    /// Fill an axis-aligned rectangle, clipped to the buffer and to the top clip.
     pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
         if width <= 0.0 || height <= 0.0 || color.a == 0 {
             return;
@@ -220,6 +394,7 @@ impl Framebuffer {
         }
     }
 
+    /// Fill a rounded rectangle and blend a border when `border_width` is positive.
     #[allow(clippy::too_many_arguments)]
     pub fn fill_rounded_rect(
         &mut self,
@@ -314,6 +489,7 @@ impl Framebuffer {
         }
     }
 
+    /// Draw a box shadow using the C++20 SDF shadow kernel when linked or `flux-gpu`'s SDF fallback.
     #[allow(clippy::too_many_arguments)]
     pub fn fill_box_shadow(
         &mut self,
@@ -338,10 +514,16 @@ impl Framebuffer {
         let sh = (height + spread_radius * 2.0).max(1.0);
         let sr = (radius + spread_radius).max(0.0);
 
-        let x0 = ((sx_rect - blur).floor() as i32).max(0);
-        let y0 = ((sy_rect - blur).floor() as i32).max(0);
-        let x1 = ((sx_rect + sw + blur).ceil() as i32).min(self.width as i32);
-        let y1 = ((sy_rect + sh + blur).ceil() as i32).min(self.height as i32);
+        let mut x0 = ((sx_rect - blur).floor() as i32).max(0);
+        let mut y0 = ((sy_rect - blur).floor() as i32).max(0);
+        let mut x1 = ((sx_rect + sw + blur).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((sy_rect + sh + blur).ceil() as i32).min(self.height as i32);
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last() {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -350,6 +532,30 @@ impl Framebuffer {
         let cx = sx_rect + half_w;
         let cy = sy_rect + half_h;
 
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            flux_cpp_fill_box_shadow_sdf(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                x0,
+                y0,
+                x1,
+                y1,
+                cx,
+                cy,
+                half_w,
+                half_h,
+                sr,
+                blur,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            );
+            return;
+        }
+        #[cfg(not(flux_cpp_accel))]
         for py in y0..y1 {
             for px in x0..x1 {
                 let sample_x = px as f32 + 0.5;
@@ -366,6 +572,7 @@ impl Framebuffer {
         }
     }
 
+    /// Fill a rounded rectangle with a two-stop linear gradient.
     #[allow(clippy::too_many_arguments)]
     pub fn fill_linear_gradient_rect(
         &mut self,
@@ -383,61 +590,105 @@ impl Framebuffer {
         if width <= 0.0 || height <= 0.0 {
             return;
         }
-        let x0 = (x.floor() as i32).max(0);
-        let y0 = (y.floor() as i32).max(0);
-        let x1 = ((x + width).ceil() as i32).min(self.width as i32);
-        let y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        let mut x0 = (x.floor() as i32).max(0);
+        let mut y0 = (y.floor() as i32).max(0);
+        let mut x1 = ((x + width).ceil() as i32).min(self.width as i32);
+        let mut y1 = ((y + height).ceil() as i32).min(self.height as i32);
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clips.last() {
+            x0 = x0.max(cx0);
+            y0 = y0.max(cy0);
+            x1 = x1.min(cx1);
+            y1 = y1.min(cy1);
+        }
         if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let half_w = width * 0.5;
-        let half_h = height * 0.5;
-        let cx = x + half_w;
-        let cy = y + half_h;
-        let gpu_start = GpuColor::rgba(start_color.r, start_color.g, start_color.b, start_color.a);
-        let gpu_end = GpuColor::rgba(end_color.r, end_color.g, end_color.b, end_color.a);
 
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let sx = px as f32 + 0.5;
-                let sy = py as f32 + 0.5;
-                let rel_x = sx - cx;
-                let rel_y = sy - cy;
-                let dist = sdf_rounded_box(rel_x, rel_y, half_w, half_h, radius);
-                let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
-                if outer_alpha <= 0.0 {
-                    continue;
-                }
-                let grad = sample_linear_gradient(
-                    rel_x, rel_y, half_w, half_h, angle_deg, gpu_start, gpu_end,
-                );
-                let mut c = Color {
-                    r: grad.r,
-                    g: grad.g,
-                    b: grad.b,
-                    a: grad.a,
-                };
-                if border_width > 0.0 {
-                    let inner_dist = dist + border_width;
-                    let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
-                    let inv = 1.0 - border_mix;
-                    c = Color {
-                        r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
-                            as u8,
-                        g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
-                            as u8,
-                        b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
-                            as u8,
-                        a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
-                            as u8,
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            flux_cpp_fill_linear_gradient_sdf(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                x0,
+                y0,
+                x1,
+                y1,
+                x,
+                y,
+                width,
+                height,
+                radius,
+                border_width,
+                angle_deg,
+                start_color.r,
+                start_color.g,
+                start_color.b,
+                start_color.a,
+                end_color.r,
+                end_color.g,
+                end_color.b,
+                end_color.a,
+                border_color.r,
+                border_color.g,
+                border_color.b,
+                border_color.a,
+            );
+            return;
+        }
+        #[cfg(not(flux_cpp_accel))]
+        {
+            let half_w = width * 0.5;
+            let half_h = height * 0.5;
+            let cx = x + half_w;
+            let cy = y + half_h;
+            let gpu_start =
+                GpuColor::rgba(start_color.r, start_color.g, start_color.b, start_color.a);
+            let gpu_end = GpuColor::rgba(end_color.r, end_color.g, end_color.b, end_color.a);
+
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    let sx = px as f32 + 0.5;
+                    let sy = py as f32 + 0.5;
+                    let rel_x = sx - cx;
+                    let rel_y = sy - cy;
+                    let dist = sdf_rounded_box(rel_x, rel_y, half_w, half_h, radius);
+                    let outer_alpha = (0.5 - dist).clamp(0.0, 1.0);
+                    if outer_alpha <= 0.0 {
+                        continue;
+                    }
+                    let grad = sample_linear_gradient(
+                        rel_x, rel_y, half_w, half_h, angle_deg, gpu_start, gpu_end,
+                    );
+                    let mut c = Color {
+                        r: grad.r,
+                        g: grad.g,
+                        b: grad.b,
+                        a: grad.a,
                     };
+                    if border_width > 0.0 {
+                        let inner_dist = dist + border_width;
+                        let border_mix = (0.5 + inner_dist).clamp(0.0, 1.0);
+                        let inv = 1.0 - border_mix;
+                        c = Color {
+                            r: ((c.r as f32) * inv + (border_color.r as f32) * border_mix).round()
+                                as u8,
+                            g: ((c.g as f32) * inv + (border_color.g as f32) * border_mix).round()
+                                as u8,
+                            b: ((c.b as f32) * inv + (border_color.b as f32) * border_mix).round()
+                                as u8,
+                            a: ((c.a as f32) * inv + (border_color.a as f32) * border_mix).round()
+                                as u8,
+                        };
+                    }
+                    c.a = ((c.a as f32) * outer_alpha).round() as u8;
+                    self.set_pixel(px, py, c);
                 }
-                c.a = ((c.a as f32) * outer_alpha).round() as u8;
-                self.set_pixel(px, py, c);
             }
         }
     }
 
+    /// Stamp one `flux-ttf` glyph and return its advance in pixels.
     pub fn draw_ttf_glyph(
         &mut self,
         x: f32,
@@ -451,20 +702,48 @@ impl Framebuffer {
         let baseline_y = y + (font.ascender as f32) * font_size / (font.units_per_em.max(1) as f32);
         let gx0 = (x.round() as i32) + bmp.bearing_x;
         let gy0 = (baseline_y.round() as i32) - bmp.bearing_y;
-        for py in 0..bmp.height {
-            for px in 0..bmp.width {
-                let cov = bmp.coverage[(py * bmp.width + px) as usize];
-                if cov == 0 {
-                    continue;
-                }
-                let mut c = color;
-                c.a = ((u16::from(c.a) * u16::from(cov) + 127) / 255) as u8;
-                self.set_pixel(gx0 + px as i32, gy0 + py as i32, c);
-            }
+
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+            flux_cpp_blend_glyph_coverage(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                gx0,
+                gy0,
+                bmp.coverage.as_ptr(),
+                bmp.width,
+                bmp.height,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            );
+            return Some(bmp.advance_px);
         }
-        Some(bmp.advance_px)
+        #[cfg(not(flux_cpp_accel))]
+        {
+            for py in 0..bmp.height {
+                for px in 0..bmp.width {
+                    let cov = bmp.coverage[(py * bmp.width + px) as usize];
+                    if cov == 0 {
+                        continue;
+                    }
+                    let mut c = color;
+                    c.a = ((u16::from(c.a) * u16::from(cov) + 127) / 255) as u8;
+                    self.set_pixel(gx0 + px as i32, gy0 + py as i32, c);
+                }
+            }
+            Some(bmp.advance_px)
+        }
     }
 
+    /// Sample a `flux-image` buffer into the rectangle.
     pub fn draw_image(
         &mut self,
         x: f32,
@@ -480,45 +759,70 @@ impl Framebuffer {
         let dst_w = width.round().max(1.0) as u32;
         let dst_h = height.round().max(1.0) as u32;
         let scaled = image.resize_bilinear(dst_w, dst_h);
-        let half_w = (dst_w as f32) * 0.5;
-        let half_h = (dst_h as f32) * 0.5;
         let base_x = x.round() as i32;
         let base_y = y.round() as i32;
 
-        for iy in 0..dst_h {
-            for ix in 0..dst_w {
-                let Some(rgba) = scaled.pixel(ix, iy) else {
-                    continue;
-                };
-                let mut alpha = rgba[3] as f32;
-                if border_radius > 0.0 {
-                    let dist = sdf_rounded_box(
-                        (ix as f32 + 0.5) - half_w,
-                        (iy as f32 + 0.5) - half_h,
-                        half_w,
-                        half_h,
-                        border_radius,
+        #[cfg(flux_cpp_accel)]
+        unsafe {
+            let (cx0, cy0, cx1, cy1) = self.active_clip_bounds();
+            flux_cpp_blit_rgba_clipped(
+                self.pixels.as_mut_ptr(),
+                self.width,
+                self.height,
+                cx0,
+                cy0,
+                cx1,
+                cy1,
+                base_x,
+                base_y,
+                scaled.pixels.as_ptr(),
+                dst_w,
+                dst_h,
+                border_radius,
+            );
+            return;
+        }
+        #[cfg(not(flux_cpp_accel))]
+        {
+            let half_w = (dst_w as f32) * 0.5;
+            let half_h = (dst_h as f32) * 0.5;
+
+            for iy in 0..dst_h {
+                for ix in 0..dst_w {
+                    let Some(rgba) = scaled.pixel(ix, iy) else {
+                        continue;
+                    };
+                    let mut alpha = rgba[3] as f32;
+                    if border_radius > 0.0 {
+                        let dist = sdf_rounded_box(
+                            (ix as f32 + 0.5) - half_w,
+                            (iy as f32 + 0.5) - half_h,
+                            half_w,
+                            half_h,
+                            border_radius,
+                        );
+                        let mask = (0.5 - dist).clamp(0.0, 1.0);
+                        alpha *= mask;
+                    }
+                    if alpha <= 0.5 {
+                        continue;
+                    }
+                    self.set_pixel(
+                        base_x + ix as i32,
+                        base_y + iy as i32,
+                        Color {
+                            r: rgba[0],
+                            g: rgba[1],
+                            b: rgba[2],
+                            a: alpha.round() as u8,
+                        },
                     );
-                    let mask = (0.5 - dist).clamp(0.0, 1.0);
-                    alpha *= mask;
                 }
-                if alpha <= 0.5 {
-                    continue;
-                }
-                self.set_pixel(
-                    base_x + ix as i32,
-                    base_y + iy as i32,
-                    Color {
-                        r: rgba[0],
-                        g: rgba[1],
-                        b: rgba[2],
-                        a: alpha.round() as u8,
-                    },
-                );
             }
         }
     }
 
+    /// Draw a run of text. Non-positive size or zero alpha returns immediately.
     pub fn draw_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         if font_size <= 0.0 || color.a == 0 {
             return;
@@ -535,6 +839,8 @@ impl Framebuffer {
         self.draw_bitmap_text(x, y, text, font_size, color);
     }
 
+    /// Walk `text` with a parsed `flux-ttf` font.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn draw_ttf_text(
         &mut self,
         x: f32,
@@ -580,6 +886,7 @@ impl Framebuffer {
         }
     }
 
+    /// Draw with the built-in 5x7 bitmap from `glyph`.
     pub fn draw_bitmap_text(&mut self, x: f32, y: f32, text: &str, font_size: f32, color: Color) {
         if font_size <= 0.0 || color.a == 0 {
             return;
@@ -669,6 +976,7 @@ impl Framebuffer {
     }
 }
 
+/// Paint `list` into a new framebuffer.
 pub fn rasterize(list: &DisplayList, width: u32, height: u32, scroll_y: f32) -> Framebuffer {
     let canvas_bg = match list.items.first() {
         Some(DisplayItem::Rect {
@@ -931,6 +1239,7 @@ fn glyph(ch: char) -> [u8; 7] {
     }
 }
 
+/// Fill, scroll, clip, fixed layers, shadows, gradients, blits, and NV12 conversion tests.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,7 +1337,6 @@ mod tests {
             ],
         };
         let fb = rasterize(&list, 16, 16, 50.0);
-        // Scrolled clipped rect is scrolled out of view, while fixed rect stays at (8, 2)
         assert_eq!(fb.pixel(9, 3), Some(gold));
         let fb_no_scroll = rasterize(&list, 16, 16, 0.0);
         assert_eq!(fb_no_scroll.pixel(2, 2), Some(blue));
@@ -1036,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_box_shadows_and_linear_gradients_via_flux_gpu() {
+    fn renders_box_shadows_and_linear_gradients() {
         let list = DisplayList {
             items: vec![
                 DisplayItem::BoxShadow {
@@ -1087,5 +1395,22 @@ mod tests {
         assert!(right.b > left.b);
         let shadow_px = fb.pixel(8, 13).unwrap();
         assert!(shadow_px.r < 255);
+    }
+
+    #[test]
+    fn converts_nv12_bt709_and_blits_clipped_images() {
+        let y_plane = [200u8; 16];
+        let uv_plane = [128u8; 8];
+        let rgba = convert_nv12_to_rgba_bt709(&y_plane, &uv_plane, 4, 4);
+        assert_eq!(rgba.len(), 4 * 4 * 4);
+        assert!(rgba[0] > 180 && rgba[3] == 255);
+
+        let img = Image::from_rgba(4, 4, rgba).unwrap();
+        let mut fb = Framebuffer::new(8, 8, Color::BLACK);
+        fb.push_clip(2.0, 2.0, 2.0, 2.0);
+        fb.draw_image(0.0, 0.0, 4.0, 4.0, 0.0, &img);
+        fb.pop_clip();
+        assert_eq!(fb.pixel(1, 1), Some(Color::BLACK));
+        assert!(fb.pixel(2, 2).unwrap().r > 180);
     }
 }

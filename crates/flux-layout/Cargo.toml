@@ -1,3 +1,7 @@
+# Box tree. Reads flux-dom and flux-style.
+# Text width comes from flux-ttf. Image intrinsic sizes come from flux-image.
+# flux-paint walks the boxes this crate returns. This crate does not paint pixels.
+
 [package]
 name = "flux-layout"
 description = "Block, inline, flex, table, and positioned boxes."

@@ -1,9 +1,14 @@
-// Flux Browser Security Center Component (flux://security)
+// Stored text for flux://security. frontend.rs security_html compiles it.
+// Only the markup block is kept. There is no script file.
+// Prop filled by the compiler: version.
+// Lines above the markup block are not copied into the page.
 // Author: Buntos
 
 export interface SecurityCenterProps {
-  version: string;
+  version: string; // Shown in the heading.
 }
+
+// Markup below is extracted. Do not put page-visible notes in that block.
 
 export function SecurityCenter(props: SecurityCenterProps) {
   return (

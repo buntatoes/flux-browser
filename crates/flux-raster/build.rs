@@ -1,10 +1,18 @@
-// Compiles cpp/flux_raster_accel.cpp when a C++ compiler is on PATH.
+// Optional C++20 scanline and compositor library for flux-raster.
 // Author: Buntos
+//
+// Compiles and links cpp/flux_raster_accel.cpp and cpp/flux_raster_compositor.cpp
+// when a C++20 compiler is available, emitting cfg(flux_cpp_accel).
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const CPP_UNITS: &[(&str, &str)] = &[
+    ("cpp/flux_raster_accel.cpp", "flux_raster_accel"),
+    ("cpp/flux_raster_compositor.cpp", "flux_raster_compositor"),
+];
 
 fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
     let roots = [
@@ -48,79 +56,91 @@ fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<P
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=cpp/flux_raster_accel.cpp");
+    println!("cargo:rerun-if-changed=cpp/flux_raster_accel.hpp");
+    for (src, _) in CPP_UNITS {
+        println!("cargo:rerun-if-changed={src}");
+        if !Path::new(src).exists() {
+            return;
+        }
+    }
     println!("cargo:rustc-check-cfg=cfg(flux_cpp_accel)");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let cpp_src = Path::new("cpp/flux_raster_accel.cpp");
-    if !cpp_src.exists() {
-        return;
-    }
 
     if cfg!(target_os = "windows") {
         if let (Some(cl_exe), Some(lib_exe)) = (find_msvc_tool("cl.exe"), find_msvc_tool("lib.exe"))
         {
-            let obj_path = out_dir.join("flux_raster_accel.obj");
-            let lib_path = out_dir.join("flux_raster_accel.lib");
-
-            let cl_status = Command::new(&cl_exe)
-                .args([
-                    "/nologo",
-                    "/c",
-                    "/O2",
-                    "/fp:fast",
-                    "/std:c++20",
-                    "/Zl",
-                    cpp_src.to_str().unwrap(),
-                    &format!("/Fo{}", obj_path.display()),
-                ])
-                .status();
-
-            if cl_status.is_ok_and(|s| s.success()) && obj_path.exists() {
-                let lib_status = Command::new(&lib_exe)
+            let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
+            for (src, stem) in CPP_UNITS {
+                let obj_path = out_dir.join(format!("{stem}.obj"));
+                let cl_status = Command::new(&cl_exe)
                     .args([
-                        "/NOLOGO",
-                        &format!("/OUT:{}", lib_path.display()),
-                        obj_path.to_str().unwrap(),
+                        "/nologo",
+                        "/c",
+                        "/O2",
+                        "/fp:fast",
+                        "/std:c++20",
+                        "/Gs1048576",
+                        "/Zl",
+                        "/Icpp",
+                        src,
+                        &format!("/Fo{}", obj_path.display()),
                     ])
                     .status();
-                if lib_status.is_ok_and(|s| s.success()) && lib_path.exists() {
-                    println!("cargo:rustc-link-search=native={}", out_dir.display());
-                    println!("cargo:rustc-link-lib=static=flux_raster_accel");
-                    println!("cargo:rustc-cfg=flux_cpp_accel");
+                if !cl_status.is_ok_and(|s| s.success()) || !obj_path.exists() {
+                    return;
                 }
+                obj_paths.push(obj_path);
             }
-        }
-    } else {
-        let obj_path = out_dir.join("flux_raster_accel.o");
-        let lib_path = out_dir.join("libflux_raster_accel.a");
-        let gpp_ok = Command::new("g++")
-            .args([
-                "-c",
-                "-O3",
-                "-std=c++20",
-                "-fno-exceptions",
-                "-fno-rtti",
-                cpp_src.to_str().unwrap(),
-                "-o",
-                obj_path.to_str().unwrap(),
-            ])
-            .status()
-            .is_ok_and(|s| s.success());
-        if gpp_ok && obj_path.exists() {
-            let ar_ok = Command::new("ar")
-                .args([
-                    "rcs",
-                    lib_path.to_str().unwrap(),
-                    obj_path.to_str().unwrap(),
-                ])
-                .status()
-                .is_ok_and(|s| s.success());
-            if ar_ok && lib_path.exists() {
+
+            let lib_path = out_dir.join("flux_raster_accel.lib");
+            let mut lib_cmd = Command::new(&lib_exe);
+            lib_cmd
+                .arg("/NOLOGO")
+                .arg(format!("/OUT:{}", lib_path.display()));
+            for obj in &obj_paths {
+                lib_cmd.arg(obj.to_str().unwrap());
+            }
+            if lib_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
                 println!("cargo:rustc-link-search=native={}", out_dir.display());
                 println!("cargo:rustc-link-lib=static=flux_raster_accel");
                 println!("cargo:rustc-cfg=flux_cpp_accel");
             }
+        }
+    } else {
+        let mut obj_paths = Vec::with_capacity(CPP_UNITS.len());
+        for (src, stem) in CPP_UNITS {
+            let obj_path = out_dir.join(format!("{stem}.o"));
+            let gpp_ok = Command::new("g++")
+                .args([
+                    "-c",
+                    "-O3",
+                    "-std=c++20",
+                    "-fno-exceptions",
+                    "-fno-rtti",
+                    "-Icpp",
+                    src,
+                    "-o",
+                    obj_path.to_str().unwrap(),
+                ])
+                .status()
+                .is_ok_and(|s| s.success());
+            if !gpp_ok || !obj_path.exists() {
+                return;
+            }
+            obj_paths.push(obj_path);
+        }
+
+        let lib_path = out_dir.join("libflux_raster_accel.a");
+        let mut ar_cmd = Command::new("ar");
+        ar_cmd.arg("rcs").arg(lib_path.to_str().unwrap());
+        for obj in &obj_paths {
+            ar_cmd.arg(obj.to_str().unwrap());
+        }
+        if ar_cmd.status().is_ok_and(|s| s.success()) && lib_path.exists() {
+            println!("cargo:rustc-link-search=native={}", out_dir.display());
+            println!("cargo:rustc-link-lib=static=flux_raster_accel");
+            println!("cargo:rustc-cfg=flux_cpp_accel");
         }
     }
 }

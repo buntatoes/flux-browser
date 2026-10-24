@@ -1,25 +1,45 @@
-//! Win32 GDI TrueType anti-aliased text rasterizer.
+//! Windows text path. This module is compiled only under `#[cfg(windows)]`.
+//!
+//! `Framebuffer::draw_text` calls [`draw_system_text`] before the built-in
+//! bitmap font. The draw goes through Win32 GDI (`gdi32`): a memory DC, a
+//! Segoe UI font, and a top-down 32-bit DIB. Coverage is the brightness of
+//! white text on a black background. This is not a GPU text pass and it does
+//! not call `flux-ttf`. A `false` return lets the bitmap font in `lib.rs` run.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 
 use crate::{Color, Framebuffer};
 
+/// GDI device context (`HDC`).
 type Hdc = *mut c_void;
+/// GDI font (`HFONT`).
 type Hfont = *mut c_void;
+/// GDI bitmap (`HBITMAP`).
 type Hbitmap = *mut c_void;
+/// Any GDI object selected into a DC.
 type HgdioBJ = *mut c_void;
 
+/// `FW_NORMAL`. Regular stroke weight, not bold.
 const FW_NORMAL: i32 = 400;
+/// `DEFAULT_CHARSET`. Let GDI pick the character set for Segoe UI.
 const DEFAULT_CHARSET: u32 = 1;
+/// `OUT_DEFAULT_PRECIS`.
 const OUT_DEFAULT_PRECIS: u32 = 0;
+/// `CLIP_DEFAULT_PRECIS`.
 const CLIP_DEFAULT_PRECIS: u32 = 0;
+/// `ANTIALIASED_QUALITY`. Grayscale edges, not ClearType.
 const ANTIALIASED_QUALITY: u32 = 4;
+/// `DEFAULT_PITCH`. No family bits; the face name selects the font.
 const DEFAULT_PITCH: u32 = 0;
+/// `BI_RGB`. Uncompressed DIB. 32-bit pixels are stored B, G, R, reserved.
 const BI_RGB: u32 = 0;
+/// `DIB_RGB_COLORS`. The color table is not used for a 32-bit DIB.
 const DIB_RGB_COLORS: u32 = 0;
+/// `OPAQUE`. GDI fills the text background instead of leaving it untouched.
 const OPAQUE: i32 = 2;
 
+/// `SIZE`. Pixel width and height from `GetTextExtentPoint32W`.
 #[repr(C)]
 #[derive(Default)]
 struct Size {
@@ -27,6 +47,7 @@ struct Size {
     cy: i32,
 }
 
+/// `BITMAPINFOHEADER`. `bi_height` is negative so the DIB is top-down.
 #[repr(C)]
 struct BitmapInfoHeader {
     bi_size: u32,
@@ -42,16 +63,21 @@ struct BitmapInfoHeader {
     bi_clr_important: u32,
 }
 
+/// `BITMAPINFO`. One unused color entry keeps the layout GDI expects.
 #[repr(C)]
 struct BitmapInfo {
     bmi_header: BitmapInfoHeader,
     bmi_colors: [u32; 1],
 }
 
+// `gdi32` entry points used to measure and draw one string. No other GDI calls.
 #[link(name = "gdi32")]
 unsafe extern "system" {
+    /// Memory DC compatible with the screen. `null` asks for a display-compatible DC.
     fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
+    /// Releases a DC from `CreateCompatibleDC`.
     fn DeleteDC(hdc: Hdc) -> i32;
+    /// Creates the Segoe UI font. A negative height is the character height in pixels.
     fn CreateFontW(
         c_height: i32,
         c_width: i32,
@@ -68,6 +94,7 @@ unsafe extern "system" {
         i_pitch_and_family: u32,
         psz_face_name: *const u16,
     ) -> Hfont;
+    /// Allocates the top-down 32-bit DIB and returns its pixel pointer.
     fn CreateDIBSection(
         hdc: Hdc,
         pbmi: *const BitmapInfo,
@@ -76,16 +103,33 @@ unsafe extern "system" {
         h_section: *mut c_void,
         offset: u32,
     ) -> Hbitmap;
+    /// Selects a font or bitmap into the DC and returns the previous object.
     fn SelectObject(hdc: Hdc, h: HgdioBJ) -> HgdioBJ;
+    /// Destroys a font or bitmap that is no longer selected.
     fn DeleteObject(ho: HgdioBJ) -> i32;
+    /// `OPAQUE` so unpainted texels stay black and read as zero coverage.
     fn SetBkMode(hdc: Hdc, mode: i32) -> i32;
+    /// Background `COLORREF`. `0x00000000` is black.
     fn SetBkColor(hdc: Hdc, color: u32) -> u32;
+    /// Text `COLORREF` in `0x00BBGGRR`. `0x00FFFFFF` is white.
     fn SetTextColor(hdc: Hdc, color: u32) -> u32;
+    /// Measures the UTF-16 string in pixels for the selected font.
     fn GetTextExtentPoint32W(hdc: Hdc, lp_string: *const u16, c: i32, psizl: *mut Size) -> i32;
+    /// Draws the string at the origin of the memory DC.
     fn TextOutW(hdc: Hdc, x: i32, y: i32, lp_string: *const u16, c: i32) -> i32;
+    /// Finishes pending GDI work before the DIB bytes are read.
     fn GdiFlush() -> i32;
 }
 
+/// Draw `text` with GDI and composite it into `fb`.
+///
+/// Returns `true` when the string was drawn or when there was nothing to draw
+/// (empty text, non-positive size, or zero alpha). Returns `false` when the
+/// DC, font, extent, or DIB cannot be created, so the caller can use the
+/// bitmap font. The glyph height is `font_size * 0.90`, at least 8 pixels.
+/// The DIB is clamped to 4096 by 512. Coverage is the average of the B, G,
+/// and R bytes, multiplied by `color.a`. The line box is `font_size * 1.25`
+/// and the bitmap is centered in it.
 pub fn draw_system_text(
     fb: &mut Framebuffer,
     x: f32,
@@ -212,6 +256,7 @@ pub fn draw_system_text(
         DeleteObject(hbmp);
         DeleteObject(hfont);
         DeleteDC(hdc);
+        // Keeps the `null` import referenced. It is not a GDI call.
         let _ = null::<c_void>();
     }
     true

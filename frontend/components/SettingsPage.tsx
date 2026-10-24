@@ -1,32 +1,45 @@
-// Flux Browser Two-Column Settings Page Component (flux://settings)
+// Stored text for flux://settings. frontend.rs
+// settings_html_with_profile_state_and_engine compiles it.
+// Only the markup block is kept. SETTINGS_JS is added later as a script
+// element and is not part of this file.
+// Props filled by the compiler: version, activeSearchEngineLabel,
+// googleCardClass, ddgCardClass, bingCardClass, scriptsEnabledStatus,
+// scriptsToggleLabel, scriptsToggleClass, jitEnabledStatus, jitToggleLabel,
+// jitToggleClass, httpsOnlyStatus, httpsToggleLabel, httpsToggleClass,
+// gpuBackendLabel, gpuVideoStatus, gpuToggleLabel, gpuToggleClass,
+// framesDecoded, framesEncoded, profileStatus, bookmarkCount, historyCount,
+// cookieCount.
+// Lines above the markup block are not copied into the page.
 // Author: Buntos
 
 export interface SettingsPageProps {
-  version: string;
-  activeSearchEngineLabel: string;
-  googleCardClass: string;
-  ddgCardClass: string;
-  bingCardClass: string;
-  scriptsEnabledStatus: string;
-  scriptsToggleLabel: string;
-  scriptsToggleClass: string;
-  jitEnabledStatus: string;
-  jitToggleLabel: string;
-  jitToggleClass: string;
-  httpsOnlyStatus: string;
-  httpsToggleLabel: string;
-  httpsToggleClass: string;
-  gpuBackendLabel: string;
-  gpuVideoStatus: string;
-  gpuToggleLabel: string;
-  gpuToggleClass: string;
-  framesDecoded: string;
-  framesEncoded: string;
-  profileStatus: string;
-  bookmarkCount: string;
-  historyCount: string;
-  cookieCount: string;
+  version: string; // Passed in. The markup block does not read it.
+  activeSearchEngineLabel: string; // Name of the selected search engine.
+  googleCardClass: string; // Class for the Google card.
+  ddgCardClass: string; // Class for the DuckDuckGo card.
+  bingCardClass: string; // Class for the Bing card.
+  scriptsEnabledStatus: string; // Sentence for script execution.
+  scriptsToggleLabel: string; // Text on the script toggle.
+  scriptsToggleClass: string; // Class on the script toggle.
+  jitEnabledStatus: string; // Sentence for the math helper.
+  jitToggleLabel: string; // Text on the math-helper toggle.
+  jitToggleClass: string; // Class on the math-helper toggle.
+  httpsOnlyStatus: string; // Sentence for strict https.
+  httpsToggleLabel: string; // Text on the https toggle.
+  httpsToggleClass: string; // Class on the https toggle.
+  gpuBackendLabel: string; // Video backend name.
+  gpuVideoStatus: string; // On or off sentence for video.
+  gpuToggleLabel: string; // Text on the video toggle.
+  gpuToggleClass: string; // Class on the video toggle.
+  framesDecoded: string; // Decoded frame count, already formatted.
+  framesEncoded: string; // Encoded frame count, already formatted.
+  profileStatus: string; // Profile seal sentence.
+  bookmarkCount: string; // Bookmark count, already formatted.
+  historyCount: string; // History count, already formatted.
+  cookieCount: string; // Cookie count, already formatted.
 }
+
+// Markup below is extracted. Do not put page-visible notes in that block.
 
 export function SettingsPage(props: SettingsPageProps) {
   return (

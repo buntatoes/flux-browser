@@ -1,42 +1,72 @@
 //! Document tree. Nodes live in one list and point at each other by id.
+//!
+//! First stage of the pipeline. [`parse_html`] turns source into a [`Document`]
+//! this crate owns. flux-style reads the tree next and does not mutate it.
+//! flux-layout and flux-paint never see the HTML source. flux-script mutates
+//! the same document. flux-browser is the owner of the live page.
+//!
+//! `<img src>` and `<video src>` (or the first `<source src>`) are recorded
+//! as element attributes. Pixel decode is flux-image's job. Timed video is
+//! flux-video's job. This crate does not decode either.
+//!
+//! Hard caps, enforced by the parser and by [`Document::set_inner_html`]:
+//! [`MAX_DOM_DEPTH`] is 256 open elements, [`MAX_DOM_NODES`] is 50_000 nodes,
+//! and [`MAX_ATTRS_PER_ELEMENT`] is 128 attributes on one start tag.
+//! Nodes detached by edits stay in the list until the document is dropped.
+//!
+//! Selectors here are a single compound: a tag, `#id`, `.class`, `tag#id`,
+//! or `tag.class`. Descendant combinators and the cascade live in flux-style.
 
 mod html;
 
 pub use html::{MAX_ATTRS_PER_ELEMENT, MAX_DOM_DEPTH, MAX_DOM_NODES, parse_html};
 
-/// Index of a node inside a [`Document`].
+/// Index of a node inside one [`Document`]'s node list.
+///
+/// The id is a copy of the slot index. It does not own the node. An id from
+/// another document, or past [`Document::node_count`], is not valid here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
 
 impl NodeId {
+    /// Build an id from a raw slot index. Does not check that a node exists.
     pub fn from_raw(index: u32) -> Self {
         Self(index)
     }
 
+    /// Slot index. Used to index the document's node vector.
     pub fn index(self) -> usize {
         self.0 as usize
     }
 }
 
-/// Why a tree edit was refused.
+/// Why [`Document::append`] refused an edit. The tree is left unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TreeError {
+    /// `parent` or `child` is not a slot in this document.
     Missing,
+    /// `child` is `parent`, or `parent` is already inside `child`.
     Cycle,
 }
 
-/// What a node contains.
+/// Payload owned by one node. The tree shape lives on [`Node`], not here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeData {
+    /// The document slot at index 0. It has no tag and no text.
     Document,
+    /// An element. `tag` is ASCII-lowercase and owned. `attrs` owns each
+    /// name and value. Names are stored lowercase by the writers in this crate.
     Element {
         tag: String,
         attrs: Vec<(String, String)>,
     },
+    /// Owned character data. Not parsed as markup.
     Text(String),
 }
 
 impl NodeData {
+    /// An element with an owned lowercase tag and no attributes.
+    /// `tag` is borrowed only for the copy.
     pub fn element(tag: &str) -> Self {
         Self::Element {
             tag: tag.to_ascii_lowercase(),
@@ -44,6 +74,7 @@ impl NodeData {
         }
     }
 
+    /// The element tag, borrowed from this node. `None` for the document and for text.
     pub fn tag(&self) -> Option<&str> {
         match self {
             Self::Element { tag, .. } => Some(tag),
@@ -51,6 +82,7 @@ impl NodeData {
         }
     }
 
+    /// The text, borrowed from this node. `None` unless this is [`NodeData::Text`].
     pub fn text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
@@ -58,6 +90,8 @@ impl NodeData {
         }
     }
 
+    /// Attribute value borrowed from this element. `None` if this is not an
+    /// element or the name is absent. Lookup ignores ASCII case.
     pub fn attr(&self, name: &str) -> Option<&str> {
         let Self::Element { attrs, .. } = self else {
             return None;
@@ -68,15 +102,20 @@ impl NodeData {
             .map(|(_, value)| value.as_str())
     }
 
+    /// The `id` attribute, borrowed. `None` when it is missing.
     pub fn id(&self) -> Option<&str> {
         self.attr("id")
     }
 
+    /// True when `class` contains `class_name` as a whole whitespace-separated token.
+    /// A missing class attribute is false. The name is not trimmed here.
     pub fn has_class(&self, class_name: &str) -> bool {
         self.attr("class")
             .is_some_and(|classes| classes.split_ascii_whitespace().any(|c| c == class_name))
     }
 
+    /// Set an attribute, storing the name in lowercase. No-op for non-elements.
+    /// Replaces an existing name. `value` is copied.
     pub fn set_attr(&mut self, name: &str, value: &str) {
         let Self::Element { attrs, .. } = self else {
             return;
@@ -89,6 +128,8 @@ impl NodeData {
         }
     }
 
+    /// Remove every attribute whose name matches, ignoring ASCII case.
+    /// Returns false for a non-element or when nothing was removed.
     pub fn remove_attr(&mut self, name: &str) -> bool {
         let Self::Element { attrs, .. } = self else {
             return false;
@@ -98,6 +139,8 @@ impl NodeData {
         attrs.len() != before
     }
 
+    /// Append a class token if it is non-empty and not already present.
+    /// No-op for non-elements. The class string is owned by the attribute.
     pub fn add_class(&mut self, class_name: &str) {
         let class_name = class_name.trim();
         if class_name.is_empty() || self.has_class(class_name) {
@@ -112,6 +155,8 @@ impl NodeData {
         self.set_attr("class", &next);
     }
 
+    /// Drop one class token. A missing class attribute is a no-op.
+    /// The remaining tokens stay in one owned `class` value, which may be empty.
     pub fn remove_class(&mut self, class_name: &str) {
         let class_name = class_name.trim();
         let Some(existing) = self.attr("class") else {
@@ -125,6 +170,8 @@ impl NodeData {
         self.set_attr("class", &joined);
     }
 
+    /// Add the class and return true, or remove it and return false.
+    /// The bool is the class's presence after the call.
     pub fn toggle_class(&mut self, class_name: &str) -> bool {
         if self.has_class(class_name) {
             self.remove_class(class_name);
@@ -136,6 +183,9 @@ impl NodeData {
     }
 }
 
+/// One slot in a [`Document`]. The document owns the node. Children are ids,
+/// not nested `Node` values. `parent` is `None` for the root and for a node
+/// that has been detached.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
     id: NodeId,
@@ -145,24 +195,33 @@ pub struct Node {
 }
 
 impl Node {
+    /// This slot's id. It is a copy, not a borrow of the document.
     pub fn id(&self) -> NodeId {
         self.id
     }
 
+    /// Parent id. `None` if this is the root or the node was detached.
     pub fn parent(&self) -> Option<NodeId> {
         self.parent
     }
 
+    /// Borrowed payload. The node keeps ownership.
     pub fn data(&self) -> &NodeData {
         &self.data
     }
 
+    /// Mutable payload. Tree links are not exposed here.
     pub fn data_mut(&mut self) -> &mut NodeData {
         &mut self.data
     }
 }
 
 /// A document and every node it owns.
+///
+/// Slots are append-only. [`Self::remove_node`], [`Self::set_text_content`],
+/// and [`Self::set_inner_html`] unlink children but leave the old slots in
+/// `nodes`, so [`Self::node_count`] does not shrink. The skeleton is the
+/// document node, then `html`, `head`, and `body`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     nodes: Vec<Node>,
@@ -172,6 +231,7 @@ pub struct Document {
 }
 
 impl Default for Document {
+    /// Same document as [`Document::new`]: document, `html`, `head`, and `body`.
     fn default() -> Self {
         Self::new()
     }
@@ -179,6 +239,8 @@ impl Default for Document {
 
 impl Document {
     /// An empty document with `html`, `head`, and `body` already in place.
+    ///
+    /// The returned value owns four nodes: document, `html`, `head`, `body`.
     pub fn new() -> Self {
         let mut doc = Self {
             nodes: Vec::new(),
@@ -199,38 +261,50 @@ impl Document {
         doc
     }
 
+    /// The document node. Always slot 0. Not the `html` element.
     pub fn root(&self) -> NodeId {
         NodeId(0)
     }
 
+    /// The `html` element created by [`Self::new`].
     pub fn html(&self) -> NodeId {
         self.html
     }
 
+    /// The `head` element created by [`Self::new`].
     pub fn head(&self) -> NodeId {
         self.head
     }
 
+    /// The `body` element created by [`Self::new`].
     pub fn body(&self) -> NodeId {
         self.body
     }
 
+    /// Slots allocated, including detached nodes that are no longer in the tree.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
+    /// Borrow the node at `id`. Panics if `id` is outside this document.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.index()]
     }
 
+    /// Mutably borrow the node. `None` if `id` is outside this document.
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         self.nodes.get_mut(id.index())
     }
 
+    /// Child ids in tree order, borrowed from the parent. Panics if `id` is outside.
     pub fn children(&self, id: NodeId) -> &[NodeId] {
         &self.nodes[id.index()].children
     }
 
+    /// Allocate an element that is not yet in the tree (`parent` is `None`).
+    ///
+    /// `tag` is copied and lowercased. `attrs` is consumed; each name is lowercased.
+    /// The returned id is owned by this document.
     pub fn create_element(&mut self, tag: &str, attrs: Vec<(String, String)>) -> NodeId {
         let mut data = NodeData::element(tag);
         if let NodeData::Element { attrs: slot, .. } = &mut data {
@@ -242,40 +316,53 @@ impl Document {
         self.alloc(data)
     }
 
+    /// Allocate a text node that is not yet in the tree. `text` is copied.
     pub fn create_text(&mut self, text: &str) -> NodeId {
         self.alloc(NodeData::Text(text.to_string()))
     }
 
+    /// Set one attribute. No-op when `id` is outside the document or not an element.
     pub fn set_attribute(&mut self, id: NodeId, name: &str, value: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.set_attr(name, value);
         }
     }
 
+    /// Remove one attribute. False when `id` is missing or the attribute was absent.
     pub fn remove_attribute(&mut self, id: NodeId, name: &str) -> bool {
         self.nodes
             .get_mut(id.index())
             .is_some_and(|node| node.data.remove_attr(name))
     }
 
+    /// Add a class token on `id`. No-op when `id` is missing or not an element.
     pub fn add_class(&mut self, id: NodeId, class_name: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.add_class(class_name);
         }
     }
 
+    /// Remove a class token on `id`. No-op when `id` is missing.
     pub fn remove_class(&mut self, id: NodeId, class_name: &str) {
         if let Some(node) = self.nodes.get_mut(id.index()) {
             node.data.remove_class(class_name);
         }
     }
 
+    /// Toggle a class on `id`. False when `id` is missing, or when the class
+    /// was removed. True when the class is present after the call.
     pub fn toggle_class(&mut self, id: NodeId, class_name: &str) -> bool {
         self.nodes
             .get_mut(id.index())
             .is_some_and(|node| node.data.toggle_class(class_name))
     }
 
+    /// Owned current value of a form control.
+    ///
+    /// A missing node yields an empty string. A `select` uses [`Self::select_value`].
+    /// Any element with a `value` attribute returns that attribute, including a
+    /// `textarea`. A `textarea` without `value` returns its text content.
+    /// Other nodes without `value` yield an empty string.
     pub fn input_value(&self, id: NodeId) -> String {
         let Some(node) = self.nodes.get(id.index()) else {
             return String::new();
@@ -293,6 +380,9 @@ impl Document {
         String::new()
     }
 
+    /// Store `value` on the `value` attribute. For a `textarea`, also replace
+    /// its text content with the same string. No-op when `id` is missing.
+    /// `value` is copied.
     pub fn set_input_value(&mut self, id: NodeId, value: &str) {
         let tag = self
             .nodes
@@ -304,6 +394,8 @@ impl Document {
         }
     }
 
+    /// True when a `checked` attribute is present and is not the word `false`.
+    /// A missing node is false.
     pub fn is_checked(&self, id: NodeId) -> bool {
         let Some(node) = self.nodes.get(id.index()) else {
             return false;
@@ -313,6 +405,7 @@ impl Document {
             .is_some_and(|val| !val.eq_ignore_ascii_case("false"))
     }
 
+    /// Set `checked="checked"`, or remove `checked` when `checked` is false.
     pub fn set_checked(&mut self, id: NodeId, checked: bool) {
         if checked {
             self.set_attribute(id, "checked", "checked");
@@ -321,12 +414,16 @@ impl Document {
         }
     }
 
+    /// Flip [`Self::is_checked`] and return the new state.
     pub fn toggle_checked(&mut self, id: NodeId) -> bool {
         let next = !self.is_checked(id);
         self.set_checked(id, next);
         next
     }
 
+    /// True for `textarea`, or for `input` whose type is empty, `text`,
+    /// `search`, `password`, `email`, `url`, `tel`, or `number`.
+    /// A missing node is false. A missing `type` counts as text.
     pub fn is_text_input(&self, id: NodeId) -> bool {
         let Some(node) = self.nodes.get(id.index()) else {
             return false;
@@ -345,6 +442,7 @@ impl Document {
         }
     }
 
+    /// True only for `<input type="checkbox">`. A missing node is false.
     pub fn is_checkbox_input(&self, id: NodeId) -> bool {
         let Some(node) = self.nodes.get(id.index()) else {
             return false;
@@ -356,12 +454,15 @@ impl Document {
                 .is_some_and(|t| t.trim().eq_ignore_ascii_case("checkbox"))
     }
 
+    /// True when `id` is a `select` element. A missing node is false.
     pub fn is_select_control(&self, id: NodeId) -> bool {
         self.nodes
             .get(id.index())
             .is_some_and(|n| n.data().tag() == Some("select"))
     }
 
+    /// Direct `option` children, in tree order. An owned list of ids.
+    /// A missing node yields an empty vec. Nested options are not walked.
     pub fn select_options(&self, select_id: NodeId) -> Vec<NodeId> {
         let Some(node) = self.nodes.get(select_id.index()) else {
             return Vec::new();
@@ -373,6 +474,8 @@ impl Document {
             .collect()
     }
 
+    /// The first option with `selected` set and not equal to `false`.
+    /// If none is marked, the first option. `None` when there are no options.
     pub fn selected_option(&self, select_id: NodeId) -> Option<NodeId> {
         let opts = self.select_options(select_id);
         opts.iter()
@@ -386,6 +489,8 @@ impl Document {
             .or_else(|| opts.first().copied())
     }
 
+    /// Owned value of the selected option: its `value` attribute, or its
+    /// trimmed text when `value` is absent. Empty when nothing is selected.
     pub fn select_value(&self, select_id: NodeId) -> String {
         let Some(opt_id) = self.selected_option(select_id) else {
             return String::new();
@@ -396,6 +501,9 @@ impl Document {
         self.text_content(opt_id).trim().to_string()
     }
 
+    /// Owned visible label of the selected option. Falls back to
+    /// [`Self::select_value`] when the option's text is empty. Empty when
+    /// nothing is selected.
     pub fn select_display_label(&self, select_id: NodeId) -> String {
         let Some(opt_id) = self.selected_option(select_id) else {
             return String::new();
@@ -408,6 +516,10 @@ impl Document {
         }
     }
 
+    /// Mark the next direct option as `selected` and clear the others.
+    ///
+    /// Wraps to the first option. Also writes the new value onto the `select`.
+    /// Returns that owned value. `None` when `select_id` has no option children.
     pub fn cycle_select_option(&mut self, select_id: NodeId) -> Option<String> {
         let opts = self.select_options(select_id);
         if opts.is_empty() {
@@ -430,6 +542,8 @@ impl Document {
         Some(new_val)
     }
 
+    /// True for `<input type="submit">`, or a `button` whose type is `submit`
+    /// or omitted. A missing node is false.
     pub fn is_submit_control(&self, id: NodeId) -> bool {
         let Some(node) = self.nodes.get(id.index()) else {
             return false;
@@ -447,6 +561,8 @@ impl Document {
         }
     }
 
+    /// The nearest `form` ancestor, including `id` itself.
+    /// `None` if `id` is missing or no ancestor is a form.
     pub fn enclosing_form(&self, id: NodeId) -> Option<NodeId> {
         let mut cursor = Some(id);
         while let Some(curr) = cursor {
@@ -459,7 +575,15 @@ impl Document {
         None
     }
 
-    /// Returns `(action, method_uppercase, urlencoded_payload)` for a `<form>` node.
+    /// Owned `(action, method, urlencoded body)` for a `form` node.
+    ///
+    /// A missing node yields `("", "GET", "")`. `method` is `POST` only when
+    /// the attribute is `POST` ignoring case; every other value, including a
+    /// missing one, is `GET`. `action` is the trimmed attribute or empty.
+    /// Named `input`, `textarea`, and `select` descendants are included.
+    /// Checkboxes and radios are included only when checked, defaulting the
+    /// value to `on`. Submit, button, and reset inputs are skipped.
+    /// Successful controls are joined with `&` using [`urlencode_component`].
     pub fn serialize_form(&self, form_id: NodeId) -> (String, String, String) {
         let Some(form_node) = self.nodes.get(form_id.index()) else {
             return (String::new(), "GET".to_string(), String::new());
@@ -491,6 +615,11 @@ impl Document {
         (action, method, encoded)
     }
 
+    /// Replace the children of `id` with one text node, or with nothing when
+    /// `text` is empty.
+    ///
+    /// Previous children stay allocated with `parent` cleared. A missing `id`
+    /// is a no-op. `text` is copied.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
         if self.nodes.get(id.index()).is_none() {
             return;
@@ -507,6 +636,12 @@ impl Document {
         }
     }
 
+    /// Make `child` the last child of `parent`.
+    ///
+    /// Both ids must already be in this document. On success the child is
+    /// detached from its previous parent. [`TreeError::Missing`] means an id
+    /// is out of range. [`TreeError::Cycle`] means the child is the parent or
+    /// an ancestor of the parent. The error leaves the tree unchanged.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> Result<(), TreeError> {
         if self.nodes.get(parent.index()).is_none() || self.nodes.get(child.index()).is_none() {
             return Err(TreeError::Missing);
@@ -527,6 +662,7 @@ impl Document {
         Ok(())
     }
 
+    /// Owned trimmed text of the first `title` element. Empty if there is none.
     pub fn title(&self) -> String {
         let Some(id) = self.find_element(self.root(), "title") else {
             return String::new();
@@ -534,6 +670,8 @@ impl Document {
         self.text_content(id).trim().to_string()
     }
 
+    /// Replace the first `title` element's text, or create one under `head`.
+    /// `title` is copied.
     pub fn set_title(&mut self, title: &str) {
         let title_id = match self.find_element(self.root(), "title") {
             Some(id) => id,
@@ -546,6 +684,10 @@ impl Document {
         self.set_text_content(title_id, title);
     }
 
+    /// First element in tree order whose `id` attribute equals `target_id`.
+    ///
+    /// An empty `target_id` is `None`. The match is case-sensitive. The id is
+    /// copied; the document is borrowed.
     pub fn get_element_by_id(&self, target_id: &str) -> Option<NodeId> {
         if target_id.is_empty() {
             return None;
@@ -553,6 +695,11 @@ impl Document {
         self.find_by_id(self.root(), target_id)
     }
 
+    /// First element in tree order that matches a simple selector.
+    ///
+    /// Accepted forms: `tag`, `#id`, `.class`, `tag#id`, `tag.class`.
+    /// Whitespace is trimmed. An empty selector is `None`. Combinators are
+    /// not supported; a descendant selector does not match. `None` if nothing matches.
     pub fn query_selector(&self, selector: &str) -> Option<NodeId> {
         let selector = selector.trim();
         if selector.is_empty() {
@@ -561,6 +708,8 @@ impl Document {
         self.find_by_simple_selector(self.root(), selector)
     }
 
+    /// Every element matching [`Self::query_selector`]'s selector grammar,
+    /// in tree order. An empty selector yields an empty vec. The ids are owned.
     pub fn query_selector_all(&self, selector: &str) -> Vec<NodeId> {
         let selector = selector.trim();
         if selector.is_empty() {
@@ -571,6 +720,9 @@ impl Document {
         matches
     }
 
+    /// Unlink `id` from its parent. The document node, `html`, `head`, and
+    /// `body` are refused. The slot and its descendants stay allocated.
+    /// Descendants keep their parent pointers.
     pub fn remove_node(&mut self, id: NodeId) {
         if id == self.root() || id == self.html || id == self.head || id == self.body {
             return;
@@ -578,6 +730,12 @@ impl Document {
         self.detach(id);
     }
 
+    /// Replace the children of `id` with a parse of `html_fragment`.
+    ///
+    /// The fragment is parsed as a document and the new `body` children are
+    /// cloned under `id`. Cloning stops at [`MAX_DOM_NODES`]. A missing `id`
+    /// is a no-op. Blank markup only detaches the old children. Old slots
+    /// stay allocated. `html_fragment` is borrowed.
     pub fn set_inner_html(&mut self, id: NodeId, html_fragment: &str) {
         if self.nodes.get(id.index()).is_none() {
             return;
@@ -598,7 +756,14 @@ impl Document {
         }
     }
 
+    /// Copy one node from a parsed fragment onto `dst_parent`, then its children.
+    ///
+    /// `Document` nodes are skipped. Past [`MAX_DOM_NODES`] the copy stops and
+    /// the rest of that subtree is dropped. A failed [`Self::append`] also
+    /// drops the new node's children. `set_inner_html` uses this to move the
+    /// fragment's body children into the live tree.
     fn clone_subtree_into(&mut self, src_doc: &Document, src_id: NodeId, dst_parent: NodeId) {
+        // Cloning stops at the same node cap as the parser. The rest of the subtree is dropped.
         if self.nodes.len() >= MAX_DOM_NODES {
             return;
         }
@@ -614,18 +779,24 @@ impl Document {
         }
     }
 
+    /// Owned text of every `style` element, joined by newlines, in tree order.
+    /// A `style` element's descendants are not scanned separately.
     pub fn embedded_css(&self) -> String {
         let mut blocks = Vec::new();
         self.collect_style(self.root(), &mut blocks);
         blocks.join("\n")
     }
 
+    /// Owned text of every `script` element whose text is not only whitespace.
+    /// External `src` scripts are not included. See [`Self::external_scripts_with_integrity`].
     pub fn scripts(&self) -> Vec<String> {
         let mut blocks = Vec::new();
         self.collect_scripts(self.root(), &mut blocks);
         blocks
     }
 
+    /// Owned `href` of every stylesheet `<link>`, in tree order.
+    /// Integrity metadata is dropped. See [`Self::stylesheet_links_with_integrity`].
     pub fn stylesheet_links(&self) -> Vec<String> {
         self.stylesheet_links_with_integrity()
             .into_iter()
@@ -633,31 +804,46 @@ impl Document {
             .collect()
     }
 
+    /// Stylesheet links as owned `(href, integrity)`.
+    ///
+    /// A link counts when `rel` contains the token `stylesheet`. `integrity`
+    /// is `None` when the attribute is absent. Empty `href` values are skipped.
     pub fn stylesheet_links_with_integrity(&self) -> Vec<(String, Option<String>)> {
         let mut links = Vec::new();
         self.collect_stylesheet_links(self.root(), &mut links);
         links
     }
 
+    /// External scripts as owned `(src, integrity)`, in tree order.
+    /// A script with an empty or missing `src` is skipped. Inline script text
+    /// is not included.
     pub fn external_scripts_with_integrity(&self) -> Vec<(String, Option<String>)> {
         let mut scripts = Vec::new();
         self.collect_external_scripts(self.root(), &mut scripts);
         scripts
     }
 
+    /// `<img>` nodes that have a non-empty `src`, as owned `(id, src)` pairs.
+    /// The image bytes are not decoded here.
     pub fn images(&self) -> Vec<(NodeId, String)> {
         let mut imgs = Vec::new();
         self.collect_images(self.root(), &mut imgs);
         imgs
     }
 
+    /// `<video>` nodes as owned `(id, src)` pairs.
+    ///
+    /// Uses the element's `src` when it is non-empty. Otherwise uses the first
+    /// child `<source src>`. Videos with neither are omitted. Bytes are not decoded.
     pub fn videos(&self) -> Vec<(NodeId, String)> {
         let mut vids = Vec::new();
         self.collect_videos(self.root(), &mut vids);
         vids
     }
 
-    /// Extract a `<meta http-equiv="Content-Security-Policy" content="...">` policy if present.
+    /// Join every `<meta http-equiv="Content-Security-Policy">` `content`
+    /// value with `"; "`. `None` when no such meta element has content.
+    /// The string is owned.
     pub fn meta_csp(&self) -> Option<String> {
         let mut out = Vec::new();
         self.collect_meta_csp(self.root(), &mut out);
@@ -668,12 +854,17 @@ impl Document {
         }
     }
 
+    /// Owned concatenation of this node's text and its descendants' text.
+    /// A missing id panics through [`Self::get`]. Element tags are not included.
     pub fn text_content(&self, id: NodeId) -> String {
         let mut out = String::new();
         self.collect_text(id, &mut out);
         out
     }
 
+    /// Append a node with no parent. The id is the index in `nodes`.
+    /// Callers must check [`MAX_DOM_NODES`] before this. The slot is not reused
+    /// after [`Self::detach`].
     fn alloc(&mut self, data: NodeData) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(Node {
@@ -685,6 +876,8 @@ impl Document {
         id
     }
 
+    /// Unlink `child` from its parent. The node stays in `nodes`.
+    /// A node that already has no parent is left as it is.
     fn detach(&mut self, child: NodeId) {
         let Some(parent) = self.nodes[child.index()].parent else {
             return;
@@ -695,6 +888,8 @@ impl Document {
         self.nodes[child.index()].parent = None;
     }
 
+    /// Depth-first search for the first element whose tag equals `tag`.
+    /// `tag` must already be lowercase. Returns `id` itself when it matches.
     fn find_element(&self, id: NodeId, tag: &str) -> Option<NodeId> {
         if self.get(id).data().tag() == Some(tag) {
             return Some(id);
@@ -707,6 +902,8 @@ impl Document {
         None
     }
 
+    /// Depth-first search for the first node whose `id` attribute equals `target_id`.
+    /// The compare is case-sensitive. The first match in tree order wins.
     fn find_by_id(&self, id: NodeId, target_id: &str) -> Option<NodeId> {
         if self.get(id).data().id() == Some(target_id) {
             return Some(id);
@@ -719,6 +916,7 @@ impl Document {
         None
     }
 
+    /// Depth-first search using [`matches_simple_selector`]. First match wins.
     fn find_by_simple_selector(&self, id: NodeId, selector: &str) -> Option<NodeId> {
         if matches_simple_selector(self.get(id).data(), selector) {
             return Some(id);
@@ -731,6 +929,7 @@ impl Document {
         None
     }
 
+    /// Push every match of `selector` under `id`, including `id`, in tree order.
     fn collect_by_simple_selector(&self, id: NodeId, selector: &str, out: &mut Vec<NodeId>) {
         if matches_simple_selector(self.get(id).data(), selector) {
             out.push(id);
@@ -740,6 +939,7 @@ impl Document {
         }
     }
 
+    /// Append this node's text, then each child's text, with no separator.
     fn collect_text(&self, id: NodeId, out: &mut String) {
         if let Some(text) = self.get(id).data().text() {
             out.push_str(text);
@@ -749,6 +949,8 @@ impl Document {
         }
     }
 
+    /// Collect non-empty `style` element text. A `style` element's children are
+    /// not walked again, so a nested element inside `style` is not a second block.
     fn collect_style(&self, id: NodeId, out: &mut Vec<String>) {
         if self.get(id).data().tag() == Some("style") {
             let css = self.text_content(id);
@@ -762,6 +964,10 @@ impl Document {
         }
     }
 
+    /// Collect inline `script` text that is not only whitespace.
+    /// A script element's children are not walked again. `src` scripts are
+    /// still visited here for their text; [`Self::collect_external_scripts`]
+    /// records the URL separately. `flux-script` runs the strings this returns.
     fn collect_scripts(&self, id: NodeId, out: &mut Vec<String>) {
         if self.get(id).data().tag() == Some("script") {
             let code = self.text_content(id);
@@ -775,6 +981,9 @@ impl Document {
         }
     }
 
+    /// Record `link rel=stylesheet` as `(href, integrity)` and keep walking.
+    /// `rel` matches the token `stylesheet`, ignoring case. Empty `href` is skipped.
+    /// `flux-browser` fetches these URLs and appends the CSS before `flux-style` runs.
     fn collect_stylesheet_links(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
         if data.tag() == Some("link") {
@@ -797,6 +1006,9 @@ impl Document {
         }
     }
 
+    /// Record `script src` as `(src, integrity)` and keep walking into children.
+    /// Empty `src` is skipped. `flux-browser` fetches the URL, checks SRI when
+    /// the integrity string is present, then passes the body to `flux-script`.
     fn collect_external_scripts(&self, id: NodeId, out: &mut Vec<(String, Option<String>)>) {
         let data = self.get(id).data();
         if data.tag() == Some("script") {
@@ -813,6 +1025,9 @@ impl Document {
         }
     }
 
+    /// Record `img` with a non-empty `src`. Does not decode bytes.
+    /// `flux-browser` fetches the URL and calls `flux-image`. `flux-layout`
+    /// later reads the decoded width and height.
     fn collect_images(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
         let data = self.get(id).data();
         if data.tag() == Some("img") {
@@ -828,6 +1043,9 @@ impl Document {
         }
     }
 
+    /// Record one URL per `video`: its `src`, or else the first child `source src`.
+    /// Nodes with neither are omitted. Bytes stay undecoded. `flux-browser`
+    /// passes the fetched body to `flux-video`.
     fn collect_videos(&self, id: NodeId, out: &mut Vec<(NodeId, String)>) {
         let data = self.get(id).data();
         if data.tag() == Some("video") {
@@ -856,6 +1074,9 @@ impl Document {
         }
     }
 
+    /// Record `meta http-equiv=Content-Security-Policy` content values.
+    /// The compare on `http-equiv` ignores case. Empty content is skipped.
+    /// `flux-net` parses the joined string as a content security policy.
     fn collect_meta_csp(&self, id: NodeId, out: &mut Vec<String>) {
         let data = self.get(id).data();
         if data.tag() == Some("meta") {
@@ -876,6 +1097,13 @@ impl Document {
         }
     }
 
+    /// Walk form controls and push `(name, value)` pairs for a submit body.
+    ///
+    /// Skips controls with an empty `name`. Checkboxes and radios contribute
+    /// only when checked (`value`, or `on` when `value` is absent). `submit`,
+    /// `button`, and `reset` inputs are skipped. Other inputs use the `value`
+    /// attribute. A `textarea` uses [`Self::input_value`]. A `select` uses the
+    /// selected option. `flux-browser` encodes the pairs for `flux-net` POST.
     fn collect_form_pairs(&self, id: NodeId, out: &mut Vec<(String, String)>) {
         let data = self.get(id).data();
         match data.tag() {
@@ -928,6 +1156,10 @@ impl Document {
     }
 }
 
+/// Encode one form field for `application/x-www-form-urlencoded`.
+///
+/// `input` is borrowed. The result is owned. Unreserved ASCII stays as-is.
+/// A space becomes `+`. Every other byte becomes `%XX` using uppercase hex.
 pub fn urlencode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
@@ -942,6 +1174,12 @@ pub fn urlencode_component(input: &str) -> String {
     out
 }
 
+/// Match one simple selector against borrowed node data.
+///
+/// Forms: `#id`, `.class`, `tag#id`, `tag.class`, or a tag name. A leading
+/// empty tag (`#id` is handled first) is allowed in the split forms. Text and
+/// the document node return false. Class and id compares are case-sensitive.
+/// The tag compare ignores ASCII case.
 fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
     let Some(actual_tag) = data.tag() else {
         return false;
@@ -965,6 +1203,8 @@ fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Parser caps, selectors, forms, and cycle checks against a real document.
+
     use super::*;
 
     #[test]

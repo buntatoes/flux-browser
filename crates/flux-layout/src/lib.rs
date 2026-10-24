@@ -1,4 +1,21 @@
-//! Block, inline, and flex layout with coordinate hit testing.
+//! Block, inline, flex, table, and positioned layout, plus hit testing.
+//!
+//! Third stage of the pipeline. flux-style has computed a `StyleMap` for a
+//! flux-dom `Document`. This crate borrows both and returns an owned
+//! [`LayoutBox`] tree. flux-paint walks that tree into a display list. This
+//! crate does not paint pixels.
+//!
+//! The origin is the top-left of the initial containing block. X increases to
+//! the right and y increases downward, in CSS pixels. [`hit_test`] uses the
+//! same space. A point on the right or bottom edge is outside the box.
+//!
+//! `position: fixed` is placed against `(0, 0)` with the parent's containing
+//! width and the parent's border-box height. It is not a separate viewport.
+//! `position: absolute` uses the parent's border box. Flex items do not wrap
+//! or grow. A table row splits its content width into equal columns with a
+//! 24px floor; column widths are not shared across rows. Line breaking uses
+//! [`measure`], a fixed advance of half the font size per character, not
+//! [`measure_proportional`].
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -13,6 +30,8 @@ pub use flux_style::{
 use flux_style::{ComputedStyle, Display, Size, StyleMap};
 use flux_ttf::TtfFont;
 
+/// Axis-aligned box. `x` and `y` are the top-left in y-down CSS pixels.
+/// Width and height grow to the right and downward.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -22,11 +41,16 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// True when `(x, y)` is inside, including the top and left edges and
+    /// excluding the right and bottom edges. A zero-area rect contains nothing.
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.width && y < self.y + self.height
     }
 }
 
+/// One painted line fragment. `text` is owned. `x` and `y` are the top-left
+/// of the run in y-down pixels. `node` is the text node, or the element that
+/// produced a form label or list marker.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRun {
     pub node: NodeId,
@@ -39,6 +63,11 @@ pub struct TextRun {
     pub underline: bool,
 }
 
+/// A border box and the children laid out inside it.
+///
+/// `rect` is the border box, margin excluded, in y-down pixels. `text` and
+/// `children` are owned. `image` is an owned clone of a decoded flux-image
+/// bitmap when one was supplied for this node; otherwise `None`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutBox {
     pub node: NodeId,
@@ -57,6 +86,8 @@ pub struct LayoutBox {
     pub children: Vec<LayoutBox>,
 }
 
+/// A slice of inline text before it is broken into line tokens.
+/// `text` is owned. The node is the text node or the element that synthesized it.
 #[derive(Clone, Debug)]
 struct Segment {
     node: NodeId,
@@ -66,6 +97,8 @@ struct Segment {
     underline: bool,
 }
 
+/// One word, a single space, a forced break (`\n`), or one character split
+/// from a word that was wider than the line.
 #[derive(Clone, Debug)]
 struct Token {
     node: NodeId,
@@ -75,11 +108,20 @@ struct Token {
     underline: bool,
 }
 
+/// Lay out `doc` from the `html` element in a viewport `viewport_width` pixels wide.
+///
+/// `doc` and `styles` are borrowed. No images are supplied, so an `<img>` or
+/// `<video>` uses its attributes or the fallback size. No control is focused.
+/// The returned tree is owned. The origin is the top-left; y grows downward.
 pub fn layout_document(doc: &Document, styles: &StyleMap, viewport_width: f32) -> LayoutBox {
     let empty = HashMap::new();
     layout_document_interactive(doc, styles, viewport_width, &empty, None)
 }
 
+/// Like [`layout_document`], with decoded images keyed by node id.
+///
+/// `images` is borrowed. A missing entry leaves the element without a bitmap.
+/// Intrinsic width and height come from the image when the attributes are absent.
 pub fn layout_document_with_images(
     doc: &Document,
     styles: &StyleMap,
@@ -89,6 +131,12 @@ pub fn layout_document_with_images(
     layout_document_interactive(doc, styles, viewport_width, images, None)
 }
 
+/// Lay out `doc`, optionally focusing one control.
+///
+/// A negative viewport width is treated as 0. When `focused_input` is a text
+/// control, the laid-out text gains a trailing `|`. A password is masked with
+/// one `*` per character. A block box whose id matches also uses the focus
+/// border color. `doc`, `styles`, and `images` are borrowed. The tree is owned.
 pub fn layout_document_interactive(
     doc: &Document,
     styles: &StyleMap,
@@ -102,6 +150,7 @@ pub fn layout_document_interactive(
         images,
         focused_input,
         doc.html(),
+        // Origin: top-left of the initial containing block. Y increases downward.
         0.0,
         0.0,
         viewport_width.max(0.0),
@@ -109,7 +158,16 @@ pub fn layout_document_interactive(
     )
 }
 
+/// The front-most node under `(x, y)` in y-down pixels.
+///
+/// `tree` is borrowed. Children are tested from highest `z-index` to lowest,
+/// and from last sibling to first when the index ties. Text runs are tested
+/// after children, in reverse order, and a hit returns the run's node, which
+/// is often a text node. The box itself is last. `None` when the point misses
+/// the tree. Overflow `hidden` rejects a point outside this box before
+/// descendants are tested, so clipped children are not hits.
 pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
+    // Hidden overflow clips hit testing to the border box, not the padding edge.
     if tree.overflow == Overflow::Hidden && !tree.rect.contains(x, y) {
         return None;
     }
@@ -135,6 +193,13 @@ pub fn hit_test(tree: &LayoutBox, x: f32, y: f32) -> Option<NodeId> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lay out `id` inside a containing block that is `containing_width` pixels wide.
+///
+/// `x` and `y` are the top-left of the margin edge, y downward. A `tr` uses
+/// the table-row algorithm even if its display is flex. Other flex containers
+/// use [`layout_flex`]. Everything else is a block. Relative offsets are applied
+/// after that used position: a positive `left` or `top` moves right or down.
+/// `left` wins over `right`, and `top` wins over `bottom`.
 fn layout_node(
     doc: &Document,
     styles: &StyleMap,
@@ -183,6 +248,7 @@ fn layout_node(
         )
     };
     if style.position == Position::Relative {
+        // Positive top/left move down/right. Positive bottom/right move up/left.
         let dx = match (style.left, style.right) {
             (Size::Px(l), _) => l,
             (Size::Auto, Size::Px(r)) => -r,
@@ -198,6 +264,11 @@ fn layout_node(
     b
 }
 
+/// Border-box width from `width` and `max-width`.
+///
+/// A pixel `width` is the content width; padding and border are added. `auto`
+/// fills the containing block minus horizontal margins. A pixel `max-width`
+/// caps the border box. The result is never negative.
 fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
     let padding_h = style.padding.left + style.padding.right;
     let border_h = style.border.left + style.border.right;
@@ -213,6 +284,12 @@ fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Block layout. In-flow children stack downward from the content top.
+///
+/// Absolute and fixed children are collected and placed after the in-flow
+/// height is known, so they do not advance `cursor_y`. Inline runs are flushed
+/// before each block child. List items receive a marker: `N. ` under `ol`,
+/// otherwise `- `. The marker's node is the `li`.
 fn layout_block(
     doc: &Document,
     styles: &StyleMap,
@@ -408,6 +485,8 @@ fn layout_block(
             color: text_color,
             underline: false,
         }];
+        // Single-line controls do not wrap. Overflow keeps the tail while focused
+        // and the head otherwise. Textareas wrap inside the content box.
         let wrap_w = if !is_textarea {
             content_width.max(4096.0)
         } else {
@@ -556,6 +635,14 @@ fn layout_block(
     }
 }
 
+/// Place an absolute or fixed box after its static position was computed at the origin.
+///
+/// Fixed uses a reference box at `(0, 0)` whose width is `viewport_width` (the
+/// containing width of the parent that pulled this box out of flow, not a
+/// separate viewport) and whose height is the parent's border-box height.
+/// Absolute uses the parent's border box. `left` wins over `right` and `top`
+/// wins over `bottom`. Missing offsets sit on the reference origin. The shift
+/// moves the whole subtree, including text runs.
 fn layout_out_of_flow(
     doc: &Document,
     styles: &StyleMap,
@@ -566,6 +653,8 @@ fn layout_out_of_flow(
     viewport_width: f32,
 ) -> LayoutBox {
     let style = *styles.get(id);
+    // Fixed origin is the top-left of the initial coordinates, y downward.
+    // The height is the parent's border box, not the viewport height.
     let ref_rect = if style.position == Position::Fixed {
         Rect {
             x: 0.0,
@@ -604,6 +693,13 @@ fn layout_out_of_flow(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lay out a `tr`. Cells share the content width equally, with a 24px floor.
+///
+/// Each cell is laid out as its own box with that column width as its
+/// containing width. The row's content height is the tallest cell, and every
+/// cell's border-box height is then overwritten to that height. Cells are
+/// placed left to right. This is not a column-balancing table: colspans,
+/// row groups, and column widths from the first row are not tracked.
 fn layout_table_row(
     doc: &Document,
     styles: &StyleMap,
@@ -633,6 +729,7 @@ fn layout_table_row(
         .filter(|cid| !is_skipped(doc, styles, *cid))
         .collect();
     let col_count = cell_ids.len().max(1);
+    // Equal columns. The floor can make the row wider than the containing block.
     let col_width = (content_width / (col_count as f32)).max(24.0);
 
     let mut children = Vec::with_capacity(cell_ids.len());
@@ -690,6 +787,13 @@ fn layout_table_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Flex layout. Items do not wrap and do not grow.
+///
+/// A column stacks children downward with `gap` between them and ignores
+/// `justify-content` and `align-items`. A row measures each item once, then
+/// packs that single line. Free space is never negative. `space-between` with
+/// one item matches start. `align-items: stretch` only increases the border-box
+/// height of an item whose height is `auto`.
 fn layout_flex(
     doc: &Document,
     styles: &StyleMap,
@@ -769,7 +873,7 @@ fn layout_flex(
         };
     }
 
-    // Row flex layout
+    // One horizontal flex line. Items are not wrapped when they overflow.
     let mut children = Vec::new();
     let mut total_item_width = 0.0_f32;
     let mut max_item_height = 0.0_f32;
@@ -897,6 +1001,8 @@ fn layout_flex(
     }
 }
 
+/// Add `dx` and `dy` to this box, its text runs, and every descendant.
+/// Positive `dy` moves the subtree downward.
 fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
     tree.rect.x += dx;
     tree.rect.y += dy;
@@ -910,6 +1016,10 @@ fn offset_box(tree: &mut LayoutBox, dx: f32, dy: f32) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Flush queued inline children into line boxes and advance `cursor_y`.
+///
+/// A pending list marker is inserted as the first segment. An empty queue
+/// with no marker does nothing. `cursor_y` is the top of the next line, y downward.
 fn place_inlines(
     doc: &Document,
     styles: &StyleMap,
@@ -943,6 +1053,8 @@ fn place_inlines(
     *cursor_y += height;
 }
 
+/// Append inline text for `id` and its descendants. `display: none` stops the walk.
+/// A `br` becomes a segment whose text is a single newline.
 fn gather(
     doc: &Document,
     styles: &StyleMap,
@@ -981,11 +1093,14 @@ fn gather(
     }
 }
 
+/// True for an element whose used display is `none`. Text nodes are not skipped.
 fn is_skipped(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     matches!(doc.get(id).data(), NodeData::Element { .. })
         && styles.get(id).display == Display::None
 }
 
+/// True for `img`, `video`, a block or flex element, or an element that
+/// contains one of those. Text nodes are inline.
 fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
@@ -998,6 +1113,7 @@ fn is_block_box(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     }
 }
 
+/// True when any descendant is `img`, `video`, block, or flex.
 fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     for child in doc.children(id) {
         if let NodeData::Element { tag, .. } = doc.get(*child).data() {
@@ -1015,6 +1131,14 @@ fn contains_block(doc: &Document, styles: &StyleMap, id: NodeId) -> bool {
     false
 }
 
+/// Break `segments` into line boxes inside `max_width`, starting at
+/// `(origin_x, origin_y)` with y downward.
+///
+/// Returns the owned runs and the total height. A line that would pass
+/// `max_width` starts a new line. A space at the start of a line is dropped.
+/// An empty line from a newline advances 16px. Other lines use the maximum
+/// [`line_height`] on that line. Adjacent tokens with the same node, size,
+/// color, and underline are merged into one run.
 fn place_lines(
     segments: &[Segment],
     origin_x: f32,
@@ -1037,6 +1161,7 @@ fn place_lines(
             continue;
         }
         let width = measure(&token.text, token.font_size);
+        // Overflow wraps before this token. A wrapping space is discarded.
         if line_width > 0.0 && line_width + width > max_width {
             trim_trailing_space(&mut current);
             if !current.is_empty() {
@@ -1105,6 +1230,9 @@ fn place_lines(
     (runs, y - origin_y)
 }
 
+/// Split segments into words and separate space tokens. A segment whose text
+/// is exactly `\n` stays one forced-break token. Other whitespace was already
+/// collapsed by the HTML parser.
 fn tokenize(segments: &[Segment]) -> Vec<Token> {
     let mut tokens = Vec::new();
     for segment in segments {
@@ -1154,6 +1282,9 @@ fn tokenize(segments: &[Segment]) -> Vec<Token> {
     tokens
 }
 
+/// Split any word wider than `max_width` into one token per character so
+/// [`place_lines`] can wrap it. Spaces and newlines are left whole.
+/// A non-positive `max_width` returns the tokens unchanged, so nothing wraps.
 fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
     if max_width <= 0.0 {
         return tokens;
@@ -1180,16 +1311,24 @@ fn explode_wide(tokens: Vec<Token>, max_width: f32) -> Vec<Token> {
     out
 }
 
+/// Drop space tokens at the end of a line before it is committed.
 fn trim_trailing_space(line: &mut Vec<Token>) {
     while line.last().is_some_and(|token| token.text == " ") {
         line.pop();
     }
 }
 
+/// Width used by line breaking: half of `font_size` per Unicode scalar.
+/// This is not the proportional width from flux-ttf.
 pub fn measure(text: &str, font_size: f32) -> f32 {
     text.chars().count() as f32 * font_size * 0.5
 }
 
+/// Proportional width from the cached system font in flux-ttf.
+///
+/// The font is loaded once. If that load returns nothing, the flux-ttf
+/// fallback width is used. Layout does not call this; callers that want a
+/// measured string do. `text` is borrowed.
 pub fn measure_proportional(text: &str, font_size: f32) -> f32 {
     static SYSTEM_FONT: OnceLock<Option<TtfFont>> = OnceLock::new();
     let font = SYSTEM_FONT.get_or_init(|| TtfFont::load_system_font(false, false));
@@ -1200,12 +1339,16 @@ pub fn measure_proportional(text: &str, font_size: f32) -> f32 {
     }
 }
 
+/// Line box height: `font_size` times 1.25. The extra quarter is leading,
+/// not a separate font metric.
 pub fn line_height(font_size: f32) -> f32 {
     font_size * 1.25
 }
 
 #[cfg(test)]
 mod tests {
+    //! Line wrapping, hit testing, flex, images, and table columns.
+
     use super::*;
     use flux_dom::parse_html;
     use flux_style::{compute_styles, parse_css};

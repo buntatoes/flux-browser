@@ -1,11 +1,14 @@
-//! Flux Browser brand logo (`assets/flux-logo.png`) and Windows `.ico` icon generator.
+//! Brand mark and the three search-engine marks drawn for settings.
 //!
-//! Embeds the official Flux Browser neon cyan-violet "f" emblem (`assets/flux-logo.png`),
-//! applies an anti-aliased squircle mask, and resamples it at any target resolution for:
-//! - The top-left browser window toolbar (`ui.rs`)
-//! - Built-in `flux://logo.png` in the top-left of `flux://settings`, `flux://home`, `flux://security`, and `flux://history`
-//! - Native Win32 window titlebar & taskbar `HICON` (`shell.rs`)
-//! - Windows `.ico` icon file (`flux-logo.ico`) for Desktop/Start Menu shortcuts and Installed Apps (`installer.rs`)
+//! `lib.rs` calls `render_flux_logo` and `render_search_engine_logo` while it
+//! resolves `flux://logo.png` and `flux://engine-*.png`. `ui.rs` and `shell.rs`
+//! call the Flux mark for the toolbar and the window icon. `installer.rs` calls
+//! `encode_flux_png` and `encode_flux_ico`.
+//!
+//! PNG and ICO bytes go through `flux-image`. The rounded mask uses
+//! `flux_gpu::sdf_rounded_box`. The search-engine marks are drawn here as
+//! pixels. They are not loaded from image files. The engines are Google Search,
+//! DuckDuckGo, and Microsoft Bing, matching `SearchEngine`.
 
 use std::sync::OnceLock;
 
@@ -16,6 +19,7 @@ use flux_image::{Image, decode_png, encode_ico, encode_png};
 /// Embedded 128x128 PNG bytes of the Flux Browser brand logo (`assets/flux-logo.png`).
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/flux-logo.png");
 
+/// Decode `LOGO_PNG_BYTES` once and fade pixels outside a rounded rectangle.
 fn master_logo() -> &'static Image {
     static MASTER: OnceLock<Image> = OnceLock::new();
     MASTER.get_or_init(|| {
@@ -163,10 +167,12 @@ pub fn render_search_engine_logo(engine: SearchEngine, size: u32) -> Image {
 
 #[cfg(test)]
 mod tests {
+    //! Checks the masked Flux mark, the ICO header, and one opaque center pixel per engine mark.
     use super::*;
     use flux_image::decode_ico;
 
     #[test]
+    /// The masked mark, the ICO bytes, and one opaque center pixel per engine mark.
     fn renders_embedded_flux_logo_and_encodes_valid_windows_ico() {
         let img = render_flux_logo(48);
         assert_eq!(img.width, 48);

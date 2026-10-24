@@ -1,12 +1,22 @@
+//! Build script for the `flux-browser` package.
+//!
+//! Cargo runs this before `src/main.rs` and `src/bin/flux-setup.rs` are linked.
+//! On Windows with the MSVC toolchain it writes an application manifest and
+//! passes that file to the linker for every binary in the package. It does not
+//! compile other languages, and it does not embed page or asset bytes. Those
+//! `include_str!` and `include_bytes!` calls live in the crate sources.
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+/// Write the Windows manifest when the target is MSVC, then emit linker arguments.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    // `/MANIFEST:EMBED` is an MSVC link flag. Other targets skip this block.
     if target_os == "windows" && target_env == "msvc" {
         if let Ok(out_dir) = env::var("OUT_DIR") {
             let manifest_path = PathBuf::from(out_dir).join("flux.manifest");
@@ -36,6 +46,8 @@ fn main() {
   </compatibility>
 </assembly>
 "#;
+            // The manifest asks for asInvoker (no elevation) and lists Windows
+            // compatibility identifiers. A failed write leaves the binaries unmanifested.
             if fs::write(&manifest_path, manifest_xml).is_ok() {
                 println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
                 println!(

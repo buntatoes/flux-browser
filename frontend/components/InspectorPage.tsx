@@ -1,16 +1,22 @@
-// Flux Browser Built-In Developer Inspector Component (flux://inspect)
+// Stored text for flux://inspect. frontend.rs inspect_html_with_state
+// compiles it. Only the markup block is kept. There is no script file.
+// Props filled by the compiler: version, tabCount, activeZoom, gpuBackend,
+// shieldBlocked, hstsCount, downloadCount, cookieCount.
+// Lines above the markup block are not copied into the page.
 // Author: Buntos
 
 export interface InspectorPageProps {
-  version: string;
-  tabCount: string;
-  activeZoom: string;
-  gpuBackend: string;
-  shieldBlocked: string;
-  hstsCount: string;
-  downloadCount: string;
-  cookieCount: string;
+  version: string; // Shown in the badge line.
+  tabCount: string; // Open tab count, already formatted.
+  activeZoom: string; // Zoom percent, already formatted with a percent sign.
+  gpuBackend: string; // Video backend label.
+  shieldBlocked: string; // Shield block count, already formatted.
+  hstsCount: string; // HSTS host count, already formatted.
+  downloadCount: string; // Download count, already formatted.
+  cookieCount: string; // Cookie count, already formatted.
 }
+
+// Markup below is extracted. Do not put page-visible notes in that block.
 
 export function InspectorPage(props: InspectorPageProps) {
   return (

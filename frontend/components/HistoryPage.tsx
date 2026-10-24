@@ -1,10 +1,17 @@
-// Flux Browser Browsing History Dashboard Component (flux://history)
+// Stored text for flux://history. frontend.rs history_html_with_entries
+// compiles it. Only the markup block is kept. There is no script file.
+// Props filled by the compiler: version, entryCount.
+// The HISTORY_ITEMS_SLOT marker in the markup is replaced with one block
+// per history entry, or the empty-state sentence.
+// Lines above the markup block are not copied into the page.
 // Author: Buntos
 
 export interface HistoryPageProps {
-  version: string;
-  entryCount: string;
+  version: string; // Shown in the badge line.
+  entryCount: string; // Entry count, already formatted.
 }
+
+// Markup below is extracted. Do not put page-visible notes in that block.
 
 export function HistoryPage(props: HistoryPageProps) {
   return (

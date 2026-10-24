@@ -1,3 +1,9 @@
+# Budgeted script interpreter. Mutates flux-dom. Parses JSON with flux-json.
+# The optional C++ file only evaluates numeric loops. It is not a general
+# compiler. fetch() reads a response the host stored in memory. It does not
+# open a socket and does not call flux-net. Page loads use flux-net from
+# flux-browser, outside this crate.
+
 [package]
 name = "flux-script"
 description = "A small script interpreter. The C++ file only does arithmetic."
