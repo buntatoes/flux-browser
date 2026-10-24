@@ -1,10 +1,10 @@
-// Stored script text for flux://history. frontend.rs copies this file into
-// a script element after flux_core.js.
+// Stored script text for root://history. frontend.rs copies this file into
+// a script element after root_core.js.
 // Author: Buntos
 
 function scanHistoryEntries() {
   let items = document.querySelectorAll('.history-item');
-  writeFluxSession('flux.history.visible_items', String(items.length));
+  writeRootSession('root.history.visible_items', String(items.length));
   return items.length;
 }
 
@@ -14,17 +14,17 @@ function bindHistoryEntries() {
   items.forEach((item) => {
     let slot = index;
     item.addEventListener('click', () => {
-      writeFluxSession('flux.history.selected_item', String(slot));
+      writeRootSession('root.history.selected_item', String(slot));
     });
     index = index + 1;
   });
   return index;
 }
 
-function initFluxHistory() {
-  recordFluxPageVisit('history');
+function initRootHistory() {
+  recordRootPageVisit('history');
   scanHistoryEntries();
   bindHistoryEntries();
 }
 
-initFluxHistory();
+initRootHistory();

@@ -1,4 +1,4 @@
-Flux Browser proprietary license
+Root Browser proprietary license
 =================================
 
 Copyright (c) 2026 Buntos
@@ -8,24 +8,24 @@ All rights reserved.
 ----------------
 This license covers:
 
-- `crates/flux-sandbox/`
-- `crates/flux-net/`
-- `crates/flux-browser/`
+- `crates/root-sandbox/`
+- `crates/root-net/`
+- `crates/root-browser/`
 - `frontend/`
-- `assets/flux-logo.png`
-- All pre-compiled binary releases (`flux.exe` and
-  `FluxBrowser-Setup-v.XX-win64.exe`)
+- `assets/root-logo.png`
+- All pre-compiled binary releases (`root.exe` and
+  `RootBrowser-Setup-v.XX-win64.exe`)
 
 2. GRANT OF LIMITED USE & SOURCE-AVAILABLE INSPECTION
 -----------------------------------------------------
 (a) Binary Execution: You are granted a personal, non-exclusive,
     non-transferable, revocable license to download and execute the official,
-    unmodified Flux Browser binary releases (`flux.exe` and
-    `FluxBrowser-Setup-v.XX-win64.exe`) for personal or internal evaluation
+    unmodified Root Browser binary releases (`root.exe` and
+    `RootBrowser-Setup-v.XX-win64.exe`) for personal or internal evaluation
     purposes.
 (b) Source-Available Security Inspection: You may view and inspect the source
     code of the covered files published in
-    `https://github.com/buntatoes/flux-browser` for personal study.
+    `https://github.com/buntatoes/root-browser` for personal study.
 
 3. STRICT PROHIBITIONS
 ----------------------
@@ -37,8 +37,8 @@ permission from Buntos:
     unmodified copies of the Covered Proprietary Components in source or
     binary form;
 (c) Remove the license notice from the covered files;
-(d) Use the "Flux", "Flux Browser", or "Buntos" name, trade dress, or the
-    circular "F" emblem (`assets/flux-logo.png`) to endorse, brand, or
+(d) Use the "Root", "Root Browser", or "Buntos" name, trade dress, or the
+    circular "F" emblem (`assets/root-logo.png`) to endorse, brand, or
     distribute any third-party or modified software.
 
 4. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY

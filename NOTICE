@@ -1,8 +1,8 @@
-Flux Browser
+Root Browser
 Copyright (c) 2026 Buntos
 
-`flux-dom`, `flux-style`, `flux-layout`, `flux-paint`, `flux-raster`, and `flux-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
+`root-dom`, `root-style`, `root-layout`, `root-paint`, `root-raster`, and `root-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
 
-`flux-sandbox`, `flux-net`, `flux-browser`, `frontend/`, and `assets/flux-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
+`root-sandbox`, `root-net`, `root-browser`, `frontend/`, and `assets/root-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
 
-`flux-cipher`, `flux-compress`, `flux-image`, `flux-json`, `flux-ttf`, `flux-gpu`, and `flux-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
+`root-cipher`, `root-compress`, `root-image`, `root-json`, `root-ttf`, `root-gpu`, and `root-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).

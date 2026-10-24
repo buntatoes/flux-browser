@@ -1,4 +1,4 @@
-// Stored text for flux://security. frontend.rs security_html compiles it.
+// Stored text for root://security. frontend.rs security_html compiles it.
 // Only the markup block is kept. There is no script file.
 // Prop filled by the compiler: version.
 // Lines above the markup block are not copied into the page.
@@ -14,10 +14,10 @@ export function SecurityCenter(props: SecurityCenterProps) {
   return (
     <div className="wrap">
       <div className="brand-bar">
-        <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
-        <p className="brand-title">Flux Security Center</p>
+        <img id="root-brand-logo" src="root://logo.png" width="38" height="38" alt="Root" />
+        <p className="brand-title">Root Security Center</p>
         <p className="brand-nav">
-          <a href="flux://home">Start</a> | <a href="flux://inspect">Inspector</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+          <a href="root://home">Start</a> | <a href="root://inspect">Inspector</a> | <a href="root://settings">Settings</a> | <a href="root://downloads">Downloads</a> | <a href="root://history">History</a> | <a href="root://security">Security</a>
         </p>
       </div>
       <div className="banner">
@@ -63,7 +63,7 @@ export function SecurityCenter(props: SecurityCenterProps) {
       </div>
 
       <p>
-        <a href="flux://home">Return to Flux Start</a>
+        <a href="root://home">Return to Root Start</a>
       </p>
     </div>
   );

@@ -1,0 +1,12 @@
+[package]
+name = "root-net"
+description = "HTTP, TLS, and a short list of blocked host names."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "LicenseRef-Proprietary"
+publish.workspace = true
+
+[dependencies]
+root-compress.workspace = true
+root-json.workspace = true

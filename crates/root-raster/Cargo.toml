@@ -1,0 +1,19 @@
+[package]
+name = "root-raster"
+description = "RGBA framebuffer. Optional C++ scanline helpers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+publish.workspace = true
+
+[dependencies]
+root-paint = { path = "../root-paint" }
+root-style = { path = "../root-style" }
+root-gpu.workspace = true
+root-image.workspace = true
+root-ttf.workspace = true
+
+[dev-dependencies]
+root-dom = { path = "../root-dom" }
+root-layout = { path = "../root-layout" }

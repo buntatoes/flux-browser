@@ -3,122 +3,122 @@
 version = 4
 
 [[package]]
-name = "flux-browser"
+name = "root-browser"
 version = "0.18.0"
 dependencies = [
- "flux-cipher",
- "flux-compress",
- "flux-dom",
- "flux-gpu",
- "flux-image",
- "flux-json",
- "flux-layout",
- "flux-net",
- "flux-paint",
- "flux-raster",
- "flux-sandbox",
- "flux-script",
- "flux-style",
- "flux-ttf",
- "flux-video",
+ "root-cipher",
+ "root-compress",
+ "root-dom",
+ "root-gpu",
+ "root-image",
+ "root-json",
+ "root-layout",
+ "root-net",
+ "root-paint",
+ "root-raster",
+ "root-sandbox",
+ "root-script",
+ "root-style",
+ "root-ttf",
+ "root-video",
 ]
 
 [[package]]
-name = "flux-cipher"
+name = "root-cipher"
 version = "0.2.0"
 
 [[package]]
-name = "flux-compress"
+name = "root-compress"
 version = "0.3.0"
 
 [[package]]
-name = "flux-dom"
+name = "root-dom"
 version = "0.18.0"
 
 [[package]]
-name = "flux-gpu"
+name = "root-gpu"
 version = "0.5.0"
 
 [[package]]
-name = "flux-image"
+name = "root-image"
 version = "0.5.0"
 dependencies = [
- "flux-compress",
+ "root-compress",
 ]
 
 [[package]]
-name = "flux-json"
+name = "root-json"
 version = "0.3.0"
 
 [[package]]
-name = "flux-layout"
+name = "root-layout"
 version = "0.18.0"
 dependencies = [
- "flux-dom",
- "flux-image",
- "flux-style",
- "flux-ttf",
+ "root-dom",
+ "root-image",
+ "root-style",
+ "root-ttf",
 ]
 
 [[package]]
-name = "flux-net"
+name = "root-net"
 version = "0.18.0"
 dependencies = [
- "flux-compress",
- "flux-json",
+ "root-compress",
+ "root-json",
 ]
 
 [[package]]
-name = "flux-paint"
+name = "root-paint"
 version = "0.18.0"
 dependencies = [
- "flux-layout",
+ "root-layout",
 ]
 
 [[package]]
-name = "flux-raster"
+name = "root-raster"
 version = "0.18.0"
 dependencies = [
- "flux-dom",
- "flux-gpu",
- "flux-image",
- "flux-layout",
- "flux-paint",
- "flux-style",
- "flux-ttf",
+ "root-dom",
+ "root-gpu",
+ "root-image",
+ "root-layout",
+ "root-paint",
+ "root-style",
+ "root-ttf",
 ]
 
 [[package]]
-name = "flux-sandbox"
+name = "root-sandbox"
 version = "0.18.0"
 dependencies = [
- "flux-json",
+ "root-json",
 ]
 
 [[package]]
-name = "flux-script"
+name = "root-script"
 version = "0.18.0"
 dependencies = [
- "flux-dom",
- "flux-json",
+ "root-dom",
+ "root-json",
 ]
 
 [[package]]
-name = "flux-style"
+name = "root-style"
 version = "0.18.0"
 dependencies = [
- "flux-dom",
+ "root-dom",
 ]
 
 [[package]]
-name = "flux-ttf"
+name = "root-ttf"
 version = "0.4.0"
 
 [[package]]
-name = "flux-video"
+name = "root-video"
 version = "0.4.0"
 dependencies = [
- "flux-cipher",
- "flux-compress",
- "flux-gpu",
+ "root-cipher",
+ "root-compress",
+ "root-gpu",
 ]

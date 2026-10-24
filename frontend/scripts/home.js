@@ -1,5 +1,5 @@
-// Stored script text for flux://home. frontend.rs copies this file into a
-// script element after flux_core.js.
+// Stored script text for root://home. frontend.rs copies this file into a
+// script element after root_core.js.
 // Author: Buntos
 
 function focusHomeSearchBox() {
@@ -16,11 +16,11 @@ function bindHomeEngineBadge() {
   if (engineBadge) {
     let altName = engineBadge.getAttribute('alt');
     if (altName !== null && altName !== '') {
-      writeFluxSession('flux.home.active_engine', altName);
+      writeRootSession('root.home.active_engine', altName);
     }
     engineBadge.addEventListener('click', () => {
-      writeFluxPref('flux.settings.section', 'search');
-      window.location.href = 'flux://settings?section=search';
+      writeRootPref('root.settings.section', 'search');
+      window.location.href = 'root://settings?section=search';
     });
     return true;
   }
@@ -28,7 +28,7 @@ function bindHomeEngineBadge() {
 }
 
 function bindHomeBrandLogo() {
-  let brandLogo = document.getElementById('flux-brand-logo');
+  let brandLogo = document.getElementById('root-brand-logo');
   if (brandLogo) {
     brandLogo.addEventListener('click', () => {
       focusHomeSearchBox();
@@ -38,11 +38,11 @@ function bindHomeBrandLogo() {
   return false;
 }
 
-function initFluxHome() {
-  recordFluxPageVisit('home');
+function initRootHome() {
+  recordRootPageVisit('home');
   focusHomeSearchBox();
   bindHomeEngineBadge();
   bindHomeBrandLogo();
 }
 
-initFluxHome();
+initRootHome();

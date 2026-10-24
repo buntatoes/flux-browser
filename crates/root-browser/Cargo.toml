@@ -1,0 +1,44 @@
+# Application crate. Two binaries: `root` (window, headless raster, --tab-worker)
+# and `root-setup` (packaged setup). Calls every engine crate plus the siblings
+# listed below.
+# root-cipher is a non-Windows dependency only. Linux profile.flx is AES-256-GCM.
+# Windows profile.flx is DPAPI and does not link root-cipher.
+# root-compress wraps the profile snapshot and the setup payload.
+# root-gpu, root-image, root-json, root-ttf, and root-video are used by the
+# session directly as well as by the engine crates.
+
+[package]
+name = "root-browser"
+description = "Window, pages, downloads, and the profile file."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "LicenseRef-Proprietary"
+publish.workspace = true
+
+[[bin]]
+name = "root"
+path = "src/main.rs"
+
+[[bin]]
+name = "root-setup"
+path = "src/bin/root-setup.rs"
+
+[dependencies]
+root-dom = { path = "../root-dom" }
+root-layout = { path = "../root-layout" }
+root-net = { path = "../root-net" }
+root-paint = { path = "../root-paint" }
+root-raster = { path = "../root-raster" }
+root-sandbox = { path = "../root-sandbox" }
+root-script = { path = "../root-script" }
+root-style = { path = "../root-style" }
+root-compress.workspace = true
+root-gpu.workspace = true
+root-image.workspace = true
+root-json.workspace = true
+root-ttf.workspace = true
+root-video.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+root-cipher.workspace = true

@@ -1,4 +1,4 @@
-// Stored text for flux://inspect. frontend.rs inspect_html_with_state
+// Stored text for root://inspect. frontend.rs inspect_html_with_state
 // compiles it. Only the markup block is kept. There is no script file.
 // Props filled by the compiler: version, tabCount, activeZoom, gpuBackend,
 // shieldBlocked, hstsCount, downloadCount, cookieCount.
@@ -22,10 +22,10 @@ export function InspectorPage(props: InspectorPageProps) {
   return (
     <div className="wrap">
       <div className="brand-bar">
-        <img id="flux-brand-logo" src="flux://logo.png" width="38" height="38" alt="Flux" />
-        <p className="brand-title">Flux Developer Inspector</p>
+        <img id="root-brand-logo" src="root://logo.png" width="38" height="38" alt="Root" />
+        <p className="brand-title">Root Developer Inspector</p>
         <p className="brand-nav">
-          <a href="flux://home">Start</a> | <a href="flux://inspect">Inspector</a> | <a href="flux://settings">Settings</a> | <a href="flux://downloads">Downloads</a> | <a href="flux://history">History</a> | <a href="flux://security">Security</a>
+          <a href="root://home">Start</a> | <a href="root://inspect">Inspector</a> | <a href="root://settings">Settings</a> | <a href="root://downloads">Downloads</a> | <a href="root://history">History</a> | <a href="root://security">Security</a>
         </p>
       </div>
 
@@ -38,7 +38,7 @@ export function InspectorPage(props: InspectorPageProps) {
           Inspect live DOM arena budgets, CSS cascade specificity, DisplayList SDF paint commands, HSTS/SRI/CSP transport policies, and W3C EME/NV12 media pipelines. Click the [&lt;&gt;] Inspector button in the top toolbar or press F12 on any page to toggle the live bottom Inspector Dock.
         </p>
         <p>
-          <a href="examples/hello.html">Inspect Local Demo DOM (examples/hello.html)</a> | <a href="flux://settings">Inspect GPU Video &amp; EME Stream</a> | <a href="flux://downloads?action=sample">Run SHA-256 Download Probe</a>
+          <a href="examples/hello.html">Inspect Local Demo DOM (examples/hello.html)</a> | <a href="root://settings">Inspect GPU Video &amp; EME Stream</a> | <a href="root://downloads?action=sample">Run SHA-256 Download Probe</a>
         </p>
       </div>
 
@@ -70,7 +70,7 @@ export function InspectorPage(props: InspectorPageProps) {
 
       <div className="section">
         <p className="sec-title">Engine Subsystem &amp; Security Budget Matrix</p>
-        <table id="flux-inspector-table">
+        <table id="root-inspector-table">
           <tr>
             <th>Subsystem</th>
             <th>Active Implementation</th>
@@ -78,31 +78,31 @@ export function InspectorPage(props: InspectorPageProps) {
             <th>Status</th>
           </tr>
           <tr>
-            <td>DOM Arena (flux-dom)</td>
+            <td>DOM Arena (root-dom)</td>
             <td>NodeId Arena + Implicit Table Auto-Close</td>
             <td>50,000 Nodes / 256 Depth / 128 Attrs</td>
             <td>ACTIVE</td>
           </tr>
           <tr>
-            <td>CSS &amp; Layout (flux-style / flux-layout)</td>
+            <td>CSS &amp; Layout (root-style / root-layout)</td>
             <td>Specificity Cascade + @media + Flexbox + Table</td>
             <td>TrueType Metrics + Z-Index Clip Stack</td>
             <td>ACTIVE</td>
           </tr>
           <tr>
-            <td>Raster &amp; Compositor (flux-raster / flux-gpu)</td>
+            <td>Raster &amp; Compositor (root-raster / root-gpu)</td>
             <td>SDF Rounded Quads, Gradients, Shadows &amp; NV12</td>
             <td>16 MP (64 MiB) Image Allocation Cap</td>
             <td>ACTIVE</td>
           </tr>
           <tr>
-            <td>Script Runtime (flux-script)</td>
+            <td>Script Runtime (root-script)</td>
             <td>Deterministic Interpreter + W3C EME Access</td>
             <td>100,000 Steps / 64 Call Depth / SOP Fetch</td>
             <td>ACTIVE</td>
           </tr>
           <tr>
-            <td>Transport &amp; Shield (flux-net)</td>
+            <td>Transport &amp; Shield (root-net)</td>
             <td>Schannel / OpenSSL TLS + HSTS + SRI SHA-256</td>
             <td>8 MiB Raw / 16 MiB Decompressed Cap</td>
             <td>ACTIVE</td>
