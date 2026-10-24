@@ -45,7 +45,7 @@ Key Apache-2.0 Terms:
    file (`Copyright (c) 2026 Buntos`).
 3. Trademarks (Section 6): This License does not grant permission to use
    the trade names, trademarks, service marks, or product names of the
-   Licensor ("Anvil", "Anvil Browser", "Buntos", or the circular "F" emblem),
+   Licensor ("Anvil", "Anvil Browser", "Buntos", or the circular anvil emblem),
    except as required for reasonable and customary use in describing the
    origin of the Work.
 
@@ -62,7 +62,7 @@ Applies to:
   `AnvilBrowser-Setup` compiled binaries)
 - `frontend/` (Privileged React/TSX and JavaScript browser shell & pages:
   `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
-- `assets/anvil-logo.png` (Official Anvil Browser Brand Emblem)
+- `assets/anvil-mark.png` (Official Anvil Browser brand mark)
 
 See `LICENSE-PROPRIETARY` for full terms:
 1. Ownership: All files, security policies, cryptographic containers, front-end

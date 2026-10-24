@@ -146,7 +146,7 @@ pub fn uninstall_default() -> Result<PathBuf, String> {
 
 /// Install the current binary into `install_dir`.
 ///
-/// Writes `anvil-logo.ico`, `anvil-logo.png`, and the three embedded example files.
+/// Writes `anvil-mark.ico`, `anvil-mark.png`, and the three embedded example files.
 /// If a local `examples` directory exists, its top-level files are copied over those.
 /// When `integrate_os` is true, Windows shortcuts and the uninstall registry key are
 /// created, or the Linux desktop entry and `HOME/.local/bin/anvil` copy are created.
@@ -225,9 +225,9 @@ pub fn install_to_dir(install_dir: &Path, integrate_os: bool) -> Result<InstallR
     // Remove any legacy standalone uninstaller from older releases
     let _ = fs::remove_file(install_dir.join("AnvilBrowser-Uninstall.exe"));
 
-    // Write bundled brand icon (`anvil-logo.ico` and `anvil-logo.png`) and `examples/` directory
-    let ico_path = install_dir.join("anvil-logo.ico");
-    let png_path = install_dir.join("anvil-logo.png");
+    // Write bundled brand icon (`anvil-mark.ico` and `anvil-mark.png`) and `examples/` directory
+    let ico_path = install_dir.join("anvil-mark.ico");
+    let png_path = install_dir.join("anvil-mark.png");
     let _ = fs::write(&ico_path, encode_anvil_ico());
     let _ = fs::write(&png_path, encode_anvil_png());
 

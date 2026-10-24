@@ -12,7 +12,7 @@ This license covers:
 - `crates/anvil-net/`
 - `crates/anvil-browser/`
 - `frontend/`
-- `assets/anvil-logo.png`
+- `assets/anvil-mark.png`
 - All pre-compiled binary releases (`anvil.exe` and
   `AnvilBrowser-Setup-v.XX-win64.exe`)
 
@@ -38,7 +38,7 @@ permission from Buntos:
     binary form;
 (c) Remove the license notice from the covered files;
 (d) Use the "Anvil", "Anvil Browser", or "Buntos" name, trade dress, or the
-    circular "F" emblem (`assets/anvil-logo.png`) to endorse, brand, or
+    circular anvil emblem (`assets/anvil-mark.png`) to endorse, brand, or
     distribute any third-party or modified software.
 
 4. DISCLAIMER OF WARRANTY & LIMITATION OF LIABILITY

@@ -16,14 +16,14 @@ use crate::SearchEngine;
 use anvil_gpu::sdf_rounded_box;
 use anvil_image::{Image, decode_png, encode_ico, encode_png};
 
-/// Embedded 512x512 PNG bytes of the Anvil Browser brand logo (`assets/anvil-logo.png`).
-pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/anvil-logo.png");
+/// Embedded 512x512 PNG bytes of the Anvil Browser brand mark (`assets/anvil-mark.png`).
+pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../../assets/anvil-mark.png");
 
 /// Decode `LOGO_PNG_BYTES` once and fade pixels outside a rounded rectangle.
 fn master_logo() -> &'static Image {
     static MASTER: OnceLock<Image> = OnceLock::new();
     MASTER.get_or_init(|| {
-        let mut img = decode_png(LOGO_PNG_BYTES).expect("valid embedded assets/anvil-logo.png");
+        let mut img = decode_png(LOGO_PNG_BYTES).expect("valid embedded assets/anvil-mark.png");
         let w = img.width as f32;
         let h = img.height as f32;
         let hw = w * 0.5;

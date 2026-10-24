@@ -3,6 +3,6 @@ Copyright (c) 2026 Buntos
 
 `anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
 
-`anvil-sandbox`, `anvil-net`, `anvil-browser`, `frontend/`, and `assets/anvil-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
+`anvil-sandbox`, `anvil-net`, `anvil-browser`, `frontend/`, and `assets/anvil-mark.png` are not under that license. See `LICENSE-PROPRIETARY`.
 
 `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).

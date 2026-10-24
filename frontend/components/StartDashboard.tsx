@@ -20,7 +20,7 @@ export function StartDashboard(props: StartDashboardProps) {
   return (
     <div className="home-blank">
       <div className="home-brand-row">
-        <img id="anvil-brand-logo" src="anvil://logo.png" width="68" height="68" alt="Anvil" />
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="112" height="112" alt="Anvil" />
         <h1 className="home-title">Anvil</h1>
       </div>
 

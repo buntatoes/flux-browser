@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./assets/anvil-logo.png" width="96" height="96" alt="Anvil" />
+  <img src="./assets/anvil-mark.png" width="128" height="128" alt="Anvil" />
   <h1>Anvil Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
   <p>
@@ -87,7 +87,7 @@ On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries 
 | `crates/anvil-browser` | Window, pages, downloads, and `profile.anvil` |
 | `frontend/` | Built-in page text and page scripts |
 
-`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are Apache-2.0. `anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, and `assets/anvil-logo.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
+`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are Apache-2.0. `anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, and `assets/anvil-mark.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
 
 ## Build
 
