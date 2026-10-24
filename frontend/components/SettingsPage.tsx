@@ -1,4 +1,4 @@
-// Stored text for root://settings. frontend.rs
+// Stored text for anvil://settings. frontend.rs
 // settings_html_with_profile_state_and_engine compiles it.
 // Only the markup block is kept. SETTINGS_JS is added later as a script
 // element and is not part of this file.
@@ -45,10 +45,10 @@ export function SettingsPage(props: SettingsPageProps) {
   return (
     <div className="settings-shell">
       <div className="brand-bar">
-        <img id="root-brand-logo" src="root://logo.png" width="36" height="36" alt="Root" />
-        <p className="brand-title">Root Settings</p>
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="36" height="36" alt="Anvil" />
+        <p className="brand-title">Anvil Settings</p>
         <p className="brand-nav">
-          <a href="root://home">Home</a> | <a href="root://settings">Settings</a> | <a href="root://downloads">Downloads</a> | <a href="root://history">History</a> | <a href="root://security">Security</a> | <a href="root://inspect">Inspector</a>
+          <a href="anvil://home">Home</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a> | <a href="anvil://inspect">Inspector</a>
         </p>
       </div>
 
@@ -56,19 +56,19 @@ export function SettingsPage(props: SettingsPageProps) {
         <div className="settings-sidebar">
           <p className="sidebar-heading">CATEGORIES</p>
           <div id="nav-sec-all" className="sidebar-item-active">
-            <a href="root://settings">All Settings</a>
+            <a href="anvil://settings">All Settings</a>
           </div>
           <div id="nav-sec-search" className="sidebar-item">
-            <a href="root://settings?section=search">Search Engine</a>
+            <a href="anvil://settings?section=search">Search Engine</a>
           </div>
           <div id="nav-sec-js" className="sidebar-item">
-            <a href="root://settings?section=js">JavaScript</a>
+            <a href="anvil://settings?section=js">JavaScript</a>
           </div>
           <div id="nav-sec-privacy" className="sidebar-item">
-            <a href="root://settings?section=privacy">Privacy &amp; Security</a>
+            <a href="anvil://settings?section=privacy">Privacy &amp; Security</a>
           </div>
           <div id="nav-sec-system" className="sidebar-item">
-            <a href="root://settings?section=system">System &amp; Hardware</a>
+            <a href="anvil://settings?section=system">System &amp; Hardware</a>
           </div>
         </div>
 
@@ -80,30 +80,30 @@ export function SettingsPage(props: SettingsPageProps) {
             </p>
             <div className="engine-grid">
               <div className={props.googleCardClass}>
-                <img src="root://engine-google.png" width="32" height="32" alt="Google" />
+                <img src="anvil://engine-google.png" width="32" height="32" alt="Google" />
                 <div className="engine-card-text">
                   <p className="engine-name">Google Search</p>
                   <p className="engine-url">www.google.com</p>
                 </div>
-                <a className="setting-action-pill" href="root://settings?engine=google">Use Google</a>
+                <a className="setting-action-pill" href="anvil://settings?engine=google">Use Google</a>
               </div>
 
               <div className={props.ddgCardClass}>
-                <img src="root://engine-ddg.png" width="32" height="32" alt="DuckDuckGo" />
+                <img src="anvil://engine-ddg.png" width="32" height="32" alt="DuckDuckGo" />
                 <div className="engine-card-text">
                   <p className="engine-name">DuckDuckGo</p>
                   <p className="engine-url">duckduckgo.com</p>
                 </div>
-                <a className="setting-action-pill" href="root://settings?engine=duckduckgo">Use DuckDuckGo</a>
+                <a className="setting-action-pill" href="anvil://settings?engine=duckduckgo">Use DuckDuckGo</a>
               </div>
 
               <div className={props.bingCardClass}>
-                <img src="root://engine-bing.png" width="32" height="32" alt="Microsoft Bing" />
+                <img src="anvil://engine-bing.png" width="32" height="32" alt="Microsoft Bing" />
                 <div className="engine-card-text">
                   <p className="engine-name">Microsoft Bing</p>
                   <p className="engine-url">www.bing.com</p>
                 </div>
-                <a className="setting-action-pill" href="root://settings?engine=bing">Use Bing</a>
+                <a className="setting-action-pill" href="anvil://settings?engine=bing">Use Bing</a>
               </div>
             </div>
           </div>
@@ -118,7 +118,7 @@ export function SettingsPage(props: SettingsPageProps) {
                 </p>
               </div>
               <div className={props.scriptsToggleClass}>
-                <a href="root://settings?toggle=scripts">{props.scriptsToggleLabel}</a>
+                <a href="anvil://settings?toggle=scripts">{props.scriptsToggleLabel}</a>
               </div>
             </div>
 
@@ -130,7 +130,7 @@ export function SettingsPage(props: SettingsPageProps) {
                 </p>
               </div>
               <div className={props.jitToggleClass}>
-                <a href="root://settings?toggle=jit">{props.jitToggleLabel}</a>
+                <a href="anvil://settings?toggle=jit">{props.jitToggleLabel}</a>
               </div>
             </div>
           </div>
@@ -145,7 +145,7 @@ export function SettingsPage(props: SettingsPageProps) {
                 </p>
               </div>
               <div className={props.httpsToggleClass}>
-                <a href="root://settings?toggle=https_only">{props.httpsToggleLabel}</a>
+                <a href="anvil://settings?toggle=https_only">{props.httpsToggleLabel}</a>
               </div>
             </div>
 
@@ -157,8 +157,8 @@ export function SettingsPage(props: SettingsPageProps) {
                 </p>
               </div>
               <div className="setting-actions-inline">
-                <a className="setting-action-pill" href="root://settings?action=save_profile">Save Snapshot</a>
-                <a className="setting-action-pill" href="root://settings?action=clear_profile">Clear Profile</a>
+                <a className="setting-action-pill" href="anvil://settings?action=save_profile">Save Snapshot</a>
+                <a className="setting-action-pill" href="anvil://settings?action=clear_profile">Clear Profile</a>
               </div>
             </div>
           </div>
@@ -173,10 +173,10 @@ export function SettingsPage(props: SettingsPageProps) {
                 </p>
               </div>
               <div className={props.gpuToggleClass}>
-                <a href="root://settings?toggle=gpu_video">{props.gpuToggleLabel}</a>
+                <a href="anvil://settings?toggle=gpu_video">{props.gpuToggleLabel}</a>
               </div>
             </div>
-            <video id="gpu-demo-video" src="root://demo.mp4" width="240" height="110"></video>
+            <video id="gpu-demo-video" src="anvil://demo.mp4" width="240" height="110"></video>
           </div>
         </div>
       </div>

@@ -3,122 +3,122 @@
 version = 4
 
 [[package]]
-name = "root-browser"
+name = "anvil-browser"
 version = "0.18.0"
 dependencies = [
- "root-cipher",
- "root-compress",
- "root-dom",
- "root-gpu",
- "root-image",
- "root-json",
- "root-layout",
- "root-net",
- "root-paint",
- "root-raster",
- "root-sandbox",
- "root-script",
- "root-style",
- "root-ttf",
- "root-video",
+ "anvil-cipher",
+ "anvil-compress",
+ "anvil-dom",
+ "anvil-gpu",
+ "anvil-image",
+ "anvil-json",
+ "anvil-layout",
+ "anvil-net",
+ "anvil-paint",
+ "anvil-raster",
+ "anvil-sandbox",
+ "anvil-script",
+ "anvil-style",
+ "anvil-ttf",
+ "anvil-video",
 ]
 
 [[package]]
-name = "root-cipher"
+name = "anvil-cipher"
 version = "0.2.0"
 
 [[package]]
-name = "root-compress"
+name = "anvil-compress"
 version = "0.3.0"
 
 [[package]]
-name = "root-dom"
+name = "anvil-dom"
 version = "0.18.0"
 
 [[package]]
-name = "root-gpu"
+name = "anvil-gpu"
 version = "0.5.0"
 
 [[package]]
-name = "root-image"
+name = "anvil-image"
 version = "0.5.0"
 dependencies = [
- "root-compress",
+ "anvil-compress",
 ]
 
 [[package]]
-name = "root-json"
+name = "anvil-json"
 version = "0.3.0"
 
 [[package]]
-name = "root-layout"
+name = "anvil-layout"
 version = "0.18.0"
 dependencies = [
- "root-dom",
- "root-image",
- "root-style",
- "root-ttf",
+ "anvil-dom",
+ "anvil-image",
+ "anvil-style",
+ "anvil-ttf",
 ]
 
 [[package]]
-name = "root-net"
+name = "anvil-net"
 version = "0.18.0"
 dependencies = [
- "root-compress",
- "root-json",
+ "anvil-compress",
+ "anvil-json",
 ]
 
 [[package]]
-name = "root-paint"
+name = "anvil-paint"
 version = "0.18.0"
 dependencies = [
- "root-layout",
+ "anvil-layout",
 ]
 
 [[package]]
-name = "root-raster"
+name = "anvil-raster"
 version = "0.18.0"
 dependencies = [
- "root-dom",
- "root-gpu",
- "root-image",
- "root-layout",
- "root-paint",
- "root-style",
- "root-ttf",
+ "anvil-dom",
+ "anvil-gpu",
+ "anvil-image",
+ "anvil-layout",
+ "anvil-paint",
+ "anvil-style",
+ "anvil-ttf",
 ]
 
 [[package]]
-name = "root-sandbox"
+name = "anvil-sandbox"
 version = "0.18.0"
 dependencies = [
- "root-json",
+ "anvil-json",
 ]
 
 [[package]]
-name = "root-script"
+name = "anvil-script"
 version = "0.18.0"
 dependencies = [
- "root-dom",
- "root-json",
+ "anvil-dom",
+ "anvil-json",
 ]
 
 [[package]]
-name = "root-style"
+name = "anvil-style"
 version = "0.18.0"
 dependencies = [
- "root-dom",
+ "anvil-dom",
 ]
 
 [[package]]
-name = "root-ttf"
+name = "anvil-ttf"
 version = "0.4.0"
 
 [[package]]
-name = "root-video"
+name = "anvil-video"
 version = "0.4.0"
 dependencies = [
- "root-cipher",
- "root-compress",
- "root-gpu",
+ "anvil-cipher",
+ "anvil-compress",
+ "anvil-gpu",
 ]

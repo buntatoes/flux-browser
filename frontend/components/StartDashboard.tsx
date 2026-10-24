@@ -1,4 +1,4 @@
-// Stored text for root://home. frontend.rs home_html_with_engine compiles it.
+// Stored text for anvil://home. frontend.rs home_html_with_engine compiles it.
 // Only the markup block is kept. HOME_JS is added later as a script element
 // and is not part of this file.
 // Props filled by the compiler: version, defaultQuery, activeEngineName,
@@ -20,12 +20,12 @@ export function StartDashboard(props: StartDashboardProps) {
   return (
     <div className="home-blank">
       <div className="home-brand-row">
-        <img id="root-brand-logo" src="root://logo.png" width="68" height="68" alt="Root" />
-        <h1 className="home-title">Root</h1>
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="68" height="68" alt="Anvil" />
+        <h1 className="home-title">Anvil</h1>
       </div>
 
       <div className="home-search-wrap">
-        <form className="search-row" action="root://navigate" method="GET">
+        <form className="search-row" action="anvil://navigate" method="GET">
           <img
             id="home-engine-badge"
             src={props.activeEngineLogo}

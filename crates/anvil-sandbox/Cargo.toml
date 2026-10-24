@@ -1,0 +1,12 @@
+[package]
+name = "anvil-sandbox"
+description = "Process limits for the window and the tab worker."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "LicenseRef-Proprietary"
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anvil-json = { workspace = true }

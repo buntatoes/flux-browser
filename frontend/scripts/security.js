@@ -1,10 +1,10 @@
-// Stored script text for root://security. frontend.rs copies this file into
-// a script element after root_core.js.
+// Stored script text for anvil://security. frontend.rs copies this file into
+// a script element after anvil_core.js.
 // Author: Buntos
 
 function scanSecuritySections() {
   let sections = document.querySelectorAll('.section');
-  writeRootSession('root.security.section_count', String(sections.length));
+  writeAnvilSession('anvil.security.section_count', String(sections.length));
   return sections.length;
 }
 
@@ -14,17 +14,17 @@ function bindSecuritySections() {
   sections.forEach((sec) => {
     let sectionIndex = index;
     sec.addEventListener('click', () => {
-      writeRootSession('root.security.active_section', String(sectionIndex));
+      writeAnvilSession('anvil.security.active_section', String(sectionIndex));
     });
     index = index + 1;
   });
   return index;
 }
 
-function initRootSecurity() {
-  recordRootPageVisit('security');
+function initAnvilSecurity() {
+  recordAnvilPageVisit('security');
   scanSecuritySections();
   bindSecuritySections();
 }
 
-initRootSecurity();
+initAnvilSecurity();

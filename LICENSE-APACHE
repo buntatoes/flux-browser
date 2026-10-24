@@ -2,12 +2,12 @@
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
 
-   SCOPE NOTE FOR ROOT BROWSER REPOSITORY:
+   SCOPE NOTE FOR ANVIL BROWSER REPOSITORY:
    This Apache License, Version 2.0 applies ONLY to the Tier 1 Core Engine
-   crates (`crates/root-dom`, `crates/root-style`, `crates/root-layout`,
-   `crates/root-paint`, `crates/root-raster`, and `crates/root-script`).
-   It does NOT apply to `crates/root-sandbox`, `crates/root-net`,
-   `crates/root-browser`, `frontend/`, or `assets/`, which are governed by
+   crates (`crates/anvil-dom`, `crates/anvil-style`, `crates/anvil-layout`,
+   `crates/anvil-paint`, `crates/anvil-raster`, and `crates/anvil-script`).
+   It does NOT apply to `crates/anvil-sandbox`, `crates/anvil-net`,
+   `crates/anvil-browser`, `frontend/`, or `assets/`, which are governed by
    `LICENSE-PROPRIETARY` (All Rights Reserved).
 
    TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION

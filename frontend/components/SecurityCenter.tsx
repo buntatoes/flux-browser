@@ -1,4 +1,4 @@
-// Stored text for root://security. frontend.rs security_html compiles it.
+// Stored text for anvil://security. frontend.rs security_html compiles it.
 // Only the markup block is kept. There is no script file.
 // Prop filled by the compiler: version.
 // Lines above the markup block are not copied into the page.
@@ -14,10 +14,10 @@ export function SecurityCenter(props: SecurityCenterProps) {
   return (
     <div className="wrap">
       <div className="brand-bar">
-        <img id="root-brand-logo" src="root://logo.png" width="38" height="38" alt="Root" />
-        <p className="brand-title">Root Security Center</p>
+        <img id="anvil-brand-logo" src="anvil://logo.png" width="38" height="38" alt="Anvil" />
+        <p className="brand-title">Anvil Security Center</p>
         <p className="brand-nav">
-          <a href="root://home">Start</a> | <a href="root://inspect">Inspector</a> | <a href="root://settings">Settings</a> | <a href="root://downloads">Downloads</a> | <a href="root://history">History</a> | <a href="root://security">Security</a>
+          <a href="anvil://home">Start</a> | <a href="anvil://inspect">Inspector</a> | <a href="anvil://settings">Settings</a> | <a href="anvil://downloads">Downloads</a> | <a href="anvil://history">History</a> | <a href="anvil://security">Security</a>
         </p>
       </div>
       <div className="banner">
@@ -63,7 +63,7 @@ export function SecurityCenter(props: SecurityCenterProps) {
       </div>
 
       <p>
-        <a href="root://home">Return to Root Start</a>
+        <a href="anvil://home">Return to Anvil Start</a>
       </p>
     </div>
   );

@@ -1,4 +1,4 @@
-/* Root Browser React/TSX Shell & Internal Dashboard Stylesheet */
+/* Anvil Browser React/TSX Shell & Internal Dashboard Stylesheet */
 /* Author: Buntos */
 
 html, body {
@@ -9,7 +9,7 @@ html, body {
   font-size: 15px;
 }
 
-.root-shell {
+.anvil-shell {
   background-color: #12151c;
   color: #f1f5f9;
 }
@@ -200,7 +200,7 @@ html, body {
   font-size: 12px;
 }
 
-/* Solid Blank Home Screen (root://home) */
+/* Solid Blank Home Screen (anvil://home) */
 .home-blank {
   padding-top: 148px;
   padding-bottom: 420px;
@@ -274,7 +274,7 @@ button {
   font-size: 14px;
 }
 
-/* Two-Column Browser Settings Layout (root://settings) */
+/* Two-Column Browser Settings Layout (anvil://settings) */
 .settings-shell {
   padding: 20px;
 }

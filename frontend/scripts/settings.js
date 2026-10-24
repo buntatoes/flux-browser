@@ -1,5 +1,5 @@
-// Stored script text for root://settings. frontend.rs copies this file into
-// a script element after root_core.js.
+// Stored script text for anvil://settings. frontend.rs copies this file into
+// a script element after anvil_core.js.
 // Author: Buntos
 
 function switchSettingsSection(sectionName) {
@@ -12,7 +12,7 @@ function switchSettingsSection(sectionName) {
       card.style.display = 'none';
     }
   });
-  writeRootPref('root.settings.section', sectionName);
+  writeAnvilPref('anvil.settings.section', sectionName);
   let navIds = [
     'nav-sec-all',
     'nav-sec-search',
@@ -35,7 +35,7 @@ function switchSettingsSection(sectionName) {
 
 function restoreInitialSettingsSection() {
   let href = window.location.href;
-  let querySec = parseRootQueryParam(href, 'section');
+  let querySec = parseAnvilQueryParam(href, 'section');
   if (querySec !== '') {
     switchSettingsSection(querySec);
     return querySec;
@@ -43,8 +43,8 @@ function restoreInitialSettingsSection() {
   return 'all';
 }
 
-function initRootSettings() {
-  recordRootPageVisit('settings');
+function initAnvilSettings() {
+  recordAnvilPageVisit('settings');
 
   let navAll = document.getElementById('nav-sec-all');
   let navSearch = document.getElementById('nav-sec-search');
@@ -81,4 +81,4 @@ function initRootSettings() {
   restoreInitialSettingsSection();
 }
 
-initRootSettings();
+initAnvilSettings();

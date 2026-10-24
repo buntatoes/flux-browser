@@ -1,8 +1,8 @@
-Root Browser
+Anvil Browser
 Copyright (c) 2026 Buntos
 
-`root-dom`, `root-style`, `root-layout`, `root-paint`, `root-raster`, and `root-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
+`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are under the Apache License 2.0 (`LICENSE-APACHE`).
 
-`root-sandbox`, `root-net`, `root-browser`, `frontend/`, and `assets/root-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
+`anvil-sandbox`, `anvil-net`, `anvil-browser`, `frontend/`, and `assets/anvil-logo.png` are not under that license. See `LICENSE-PROPRIETARY`.
 
-`root-cipher`, `root-compress`, `root-image`, `root-json`, `root-ttf`, `root-gpu`, and `root-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).
+`anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`, and `anvil-video` are separate repositories under the Mozilla Public License 2.0 (`LICENSE-MPL`).

@@ -1,0 +1,44 @@
+# Application crate. Two binaries: `anvil` (window, headless raster, --tab-worker)
+# and `anvil-setup` (packaged setup). Calls every engine crate plus the siblings
+# listed below.
+# anvil-cipher is a non-Windows dependency only. Linux profile.flx is AES-256-GCM.
+# Windows profile.flx is DPAPI and does not link anvil-cipher.
+# anvil-compress wraps the profile snapshot and the setup payload.
+# anvil-gpu, anvil-image, anvil-json, anvil-ttf, and anvil-video are used by the
+# session directly as well as by the engine crates.
+
+[package]
+name = "anvil-browser"
+description = "Window, pages, downloads, and the profile file."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "LicenseRef-Proprietary"
+publish.workspace = true
+
+[[bin]]
+name = "anvil"
+path = "src/main.rs"
+
+[[bin]]
+name = "anvil-setup"
+path = "src/bin/anvil-setup.rs"
+
+[dependencies]
+anvil-dom = { path = "../anvil-dom" }
+anvil-layout = { path = "../anvil-layout" }
+anvil-net = { path = "../anvil-net" }
+anvil-paint = { path = "../anvil-paint" }
+anvil-raster = { path = "../anvil-raster" }
+anvil-sandbox = { path = "../anvil-sandbox" }
+anvil-script = { path = "../anvil-script" }
+anvil-style = { path = "../anvil-style" }
+anvil-compress.workspace = true
+anvil-gpu.workspace = true
+anvil-image.workspace = true
+anvil-json.workspace = true
+anvil-ttf.workspace = true
+anvil-video.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+anvil-cipher.workspace = true

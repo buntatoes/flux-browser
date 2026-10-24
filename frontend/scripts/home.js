@@ -1,5 +1,5 @@
-// Stored script text for root://home. frontend.rs copies this file into a
-// script element after root_core.js.
+// Stored script text for anvil://home. frontend.rs copies this file into a
+// script element after anvil_core.js.
 // Author: Buntos
 
 function focusHomeSearchBox() {
@@ -16,11 +16,11 @@ function bindHomeEngineBadge() {
   if (engineBadge) {
     let altName = engineBadge.getAttribute('alt');
     if (altName !== null && altName !== '') {
-      writeRootSession('root.home.active_engine', altName);
+      writeAnvilSession('anvil.home.active_engine', altName);
     }
     engineBadge.addEventListener('click', () => {
-      writeRootPref('root.settings.section', 'search');
-      window.location.href = 'root://settings?section=search';
+      writeAnvilPref('anvil.settings.section', 'search');
+      window.location.href = 'anvil://settings?section=search';
     });
     return true;
   }
@@ -28,7 +28,7 @@ function bindHomeEngineBadge() {
 }
 
 function bindHomeBrandLogo() {
-  let brandLogo = document.getElementById('root-brand-logo');
+  let brandLogo = document.getElementById('anvil-brand-logo');
   if (brandLogo) {
     brandLogo.addEventListener('click', () => {
       focusHomeSearchBox();
@@ -38,11 +38,11 @@ function bindHomeBrandLogo() {
   return false;
 }
 
-function initRootHome() {
-  recordRootPageVisit('home');
+function initAnvilHome() {
+  recordAnvilPageVisit('home');
   focusHomeSearchBox();
   bindHomeEngineBadge();
   bindHomeBrandLogo();
 }
 
-initRootHome();
+initAnvilHome();

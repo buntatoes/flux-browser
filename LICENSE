@@ -1,4 +1,4 @@
-Root Browser license
+Anvil Browser license
 =====================
 
 Copyright (c) 2026 Buntos
@@ -13,12 +13,12 @@ Three licenses apply:
 PART I: PERMISSIVE ENGINE TIER (Apache License, Version 2.0)
 ------------------------------------------------------------------------
 Applies exclusively to:
-- `crates/root-dom` (HTML parser & bounded DOM tree)
-- `crates/root-style` (CSS parser & specificity cascade)
-- `crates/root-layout` (Block, Inline, Flexbox, & Table layout engine)
-- `crates/root-paint` (Display list generation & viewport scaling)
-- `crates/root-raster` (RGBA framebuffer & C++20 SIMD/SDF raster kernel)
-- `crates/root-script` (script interpreter)
+- `crates/anvil-dom` (HTML parser & bounded DOM tree)
+- `crates/anvil-style` (CSS parser & specificity cascade)
+- `crates/anvil-layout` (Block, Inline, Flexbox, & Table layout engine)
+- `crates/anvil-paint` (Display list generation & viewport scaling)
+- `crates/anvil-raster` (RGBA framebuffer & C++20 SIMD/SDF raster kernel)
+- `crates/anvil-script` (script interpreter)
 
 Licensed under the Apache License, Version 2.0 (the "Apache License");
 you may not use the files in the crates listed in Part I except in
@@ -45,7 +45,7 @@ Key Apache-2.0 Terms:
    file (`Copyright (c) 2026 Buntos`).
 3. Trademarks (Section 6): This License does not grant permission to use
    the trade names, trademarks, service marks, or product names of the
-   Licensor ("Root", "Root Browser", "Buntos", or the circular "F" emblem),
+   Licensor ("Anvil", "Anvil Browser", "Buntos", or the circular "F" emblem),
    except as required for reasonable and customary use in describing the
    origin of the Work.
 
@@ -54,15 +54,15 @@ PART II: HARDCODED SECURITY, SANDBOX, SHIELD & APPLICATION TIER
          (Proprietary — All Rights Reserved)
 ------------------------------------------------------------------------
 Applies to:
-- `crates/root-sandbox` (Mandatory OS process isolation & job-object guard)
-- `crates/root-net` (Pre-Socket Tracker/Ad/Malware Shield, HSTS, FIPS 180-4
+- `crates/anvil-sandbox` (Mandatory OS process isolation & job-object guard)
+- `crates/anvil-net` (Pre-Socket Tracker/Ad/Malware Shield, HSTS, FIPS 180-4
   SHA-256 Subresource Integrity, CSP, CORP, RFC 6265bis CookieJar, & TLS)
-- `crates/root-browser` (Windows DPAPI `profile.flx` encryption, SHA-256
-  Download Verifier & Quarantine, UI shell, installer, and `root.exe` /
-  `RootBrowser-Setup` compiled binaries)
+- `crates/anvil-browser` (Windows DPAPI `profile.flx` encryption, SHA-256
+  Download Verifier & Quarantine, UI shell, installer, and `anvil.exe` /
+  `AnvilBrowser-Setup` compiled binaries)
 - `frontend/` (Privileged React/TSX and JavaScript browser shell & pages:
   `App.tsx`, `components/*.tsx`, `scripts/*.js`, and `styles/browser.css`)
-- `assets/root-logo.png` (Official Root Browser Brand Emblem)
+- `assets/anvil-logo.png` (Official Anvil Browser Brand Emblem)
 
 See `LICENSE-PROPRIETARY` for full terms:
 1. Ownership: All files, security policies, cryptographic containers, front-end
@@ -78,8 +78,8 @@ See `LICENSE-PROPRIETARY` for full terms:
 PART III: STANDALONE COMPANION LIBRARIES (Mozilla Public License 2.0)
 ------------------------------------------------------------------------
 Applies to standalone companion crates authored by Buntos:
-- `root-cipher`, `root-compress`, `root-image`, `root-json`, `root-ttf`, `root-gpu`,
-  and `root-video`
+- `anvil-cipher`, `anvil-compress`, `anvil-image`, `anvil-json`, `anvil-ttf`, `anvil-gpu`,
+  and `anvil-video`
 
 Licensed under the Mozilla Public License, v. 2.0 (`MPL-2.0`). See
 `LICENSE-MPL` for the full verbatim text of the Mozilla Public License,

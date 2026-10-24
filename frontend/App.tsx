@@ -1,6 +1,6 @@
 // Stored text. frontend.rs compile_tsx_component keeps the markup block and
 // replaces className with class. This file is the window frame document, not
-// a root:// page. render_react_shell_html fills the props below and replaces
+// a anvil:// page. render_react_shell_html fills the props below and replaces
 // these slot markers in the markup: TABS_SLOT, BOOKMARKS_SLOT, FIND_BAR_SLOT,
 // APP_MENU_SLOT, CONTEXT_MENU_SLOT, VIEWPORT_SLOT, INSPECTOR_DOCK_SLOT.
 // Props passed in: version, activeUrl, addressDisplay, addressClass,
@@ -41,40 +41,40 @@ export interface BrowserShellProps {
 
 // Markup below is extracted. Do not put page-visible notes in that block.
 
-export function RootBrowserApp(props: BrowserShellProps) {
+export function AnvilBrowserApp(props: BrowserShellProps) {
   return (
-    <div id="root-react-shell" className="root-shell">
-      <div id="root-tab-strip" className="tab-strip">
+    <div id="anvil-react-shell" className="anvil-shell">
+      <div id="anvil-tab-strip" className="tab-strip">
         <img
-          id="root-shell-logo"
-          src="root://logo.png"
+          id="anvil-shell-logo"
+          src="anvil://logo.png"
           width="24"
           height="24"
-          alt="Root"
+          alt="Anvil"
           data-ui-action="home"
         />
         {{TABS_SLOT}}
-        <button id="root-new-tab" className="new-tab-btn" data-ui-action="new-tab">
+        <button id="anvil-new-tab" className="new-tab-btn" data-ui-action="new-tab">
           +
         </button>
       </div>
 
-      <div id="root-nav-bar" className="nav-bar">
-        <button id="root-btn-back" className="nav-btn" data-ui-action="back">
+      <div id="anvil-nav-bar" className="nav-bar">
+        <button id="anvil-btn-back" className="nav-btn" data-ui-action="back">
           &lt;
         </button>
-        <button id="root-btn-forward" className="nav-btn" data-ui-action="forward">
+        <button id="anvil-btn-forward" className="nav-btn" data-ui-action="forward">
           &gt;
         </button>
-        <button id="root-btn-reload" className="nav-btn" data-ui-action="reload">
+        <button id="anvil-btn-reload" className="nav-btn" data-ui-action="reload">
           R
         </button>
-        <button id="root-btn-home" className="nav-btn" data-ui-action="home">
+        <button id="anvil-btn-home" className="nav-btn" data-ui-action="home">
           H
         </button>
 
         <div
-          id="root-security-badge"
+          id="anvil-security-badge"
           className={props.securityClass}
           data-ui-action="security-badge"
         >
@@ -82,7 +82,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </div>
 
         <div
-          id="root-address-bar"
+          id="anvil-address-bar"
           className={props.addressClass}
           data-ui-action="address-field"
         >
@@ -90,7 +90,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </div>
 
         <button
-          id="root-btn-bookmark"
+          id="anvil-btn-bookmark"
           className={props.starClass}
           data-ui-action="toggle-bookmark"
         >
@@ -98,7 +98,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="root-zoom-pill"
+          id="anvil-zoom-pill"
           className="zoom-pill"
           data-ui-action="zoom-pill"
         >
@@ -106,7 +106,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="root-btn-settings"
+          id="anvil-btn-settings"
           className="settings-btn"
           data-ui-action="settings-button"
         >
@@ -114,7 +114,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="root-btn-downloads"
+          id="anvil-btn-downloads"
           className="nav-btn"
           data-ui-action="downloads-button"
         >
@@ -122,7 +122,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="root-btn-inspector"
+          id="anvil-btn-inspector"
           className={props.inspectorClass}
           data-ui-action="inspector-button"
         >
@@ -130,7 +130,7 @@ export function RootBrowserApp(props: BrowserShellProps) {
         </button>
 
         <button
-          id="root-btn-app-menu"
+          id="anvil-btn-app-menu"
           className={props.appMenuClass}
           data-ui-action="app-menu-button"
         >
@@ -146,17 +146,17 @@ export function RootBrowserApp(props: BrowserShellProps) {
 
       {{CONTEXT_MENU_SLOT}}
 
-      <div id="root-viewport-slot" className="viewport-slot">
+      <div id="anvil-viewport-slot" className="viewport-slot">
         {{VIEWPORT_SLOT}}
       </div>
 
       {{INSPECTOR_DOCK_SLOT}}
 
-      <div id="root-status-bar" className="status-bar">
-        <span id="root-status-left" className="status-left">
+      <div id="anvil-status-bar" className="status-bar">
+        <span id="anvil-status-left" className="status-left">
           {props.statusLeft}
         </span>
-        <span id="root-status-right" className="status-right">
+        <span id="anvil-status-right" className="status-right">
           {props.statusRight}
         </span>
       </div>

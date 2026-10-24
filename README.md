@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="./assets/root-logo.png" width="96" height="96" alt="Root" />
-  <h1>Root Browser</h1>
+  <img src="./assets/anvil-logo.png" width="96" height="96" alt="Anvil" />
+  <h1>Anvil Browser</h1>
   <p>A small desktop browser Proof of Concept (PoC), written from scratch in Rust, C++20, and JavaScript.</p>
   <p>
     <img src="https://img.shields.io/badge/release-v.18-ff6b24?style=flat-square" alt="v.18" />
@@ -14,18 +14,18 @@
 
 Version 0.18. Author: Buntos.
 
-Root Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
+Anvil Browser loads HTML, applies a CSS cascade, lays the page out, and paints it into a CPU RGBA buffer. Windows can upload that finished buffer to Direct3D 11. Linux copies it with X11. The page is rasterized on the CPU either way.
 
 There are no crates.io dependencies. The engine crates live in this repository. Seven companion libraries sit beside it and are linked by path.
 
 ## Download
 
-Windows x64 builds are attached to the [v.18 release](https://github.com/buntatoes/root-browser/releases/tag/v.18).
+Windows x64 builds are attached to the [v.18 release](https://github.com/buntatoes/anvil-browser/releases/tag/v.18).
 
 | File | What it is |
 | --- | --- |
-| `RootBrowser-Setup-v.18-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
-| `root.exe` | The browser by itself, with no installer. |
+| `AnvilBrowser-Setup-v.18-win64.exe` | One setup program. It installs, and it uninstalls with `--uninstall`. |
+| `anvil.exe` | The browser by itself, with no installer. |
 
 SHA-256 checksums are in the release notes. The setup program is not required to build from source.
 
@@ -40,15 +40,15 @@ SHA-256 checksums are in the release notes. The setup program is not required to
 - Script runs in a budgeted Rust interpreter. A whole script is sent to the numeric C++ VM only when that compiler accepts it and the script does not touch the DOM, `fetch()`, or storage. Loop and function bodies inside a Rust script stay on the Rust interpreter. The caller owns the VM context. This is not a general compiler.
 - `fetch()` is same-origin only. A cross-origin URL returns status 403 and does not connect. The interpreter keeps at most 64 KiB of the body. The numeric VM does not perform `fetch()`.
 - `localStorage` and `sessionStorage` are partitioned by origin. Each origin may store 64 KiB of key and value bytes. A write past that cap leaves the previous value in place. `sessionStorage` dies with the tab.
-- HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks go through `root-net`. A short list of host names is blocked before connect.
-- An http or https load starts one `--tab-worker` process and waits 5 seconds for one `ROOTIPC1` frame. The window paints the document from that frame and does not run those scripts again. A timeout or a bad frame shows an error page. `root://` pages and local files stay in the window process. The worker does not receive the session cookie jar or `localStorage`. This is not a multi-process sandbox.
+- HTTP/1.1 GET and POST, TLS, cookies, HSTS, CSP, CORP, and SHA-256 subresource checks go through `anvil-net`. A short list of host names is blocked before connect.
+- An http or https load starts one `--tab-worker` process and waits 5 seconds for one `ANVILIPC` frame. The window paints the document from that frame and does not run those scripts again. A timeout or a bad frame shows an error page. `anvil://` pages and local files stay in the window process. The worker does not receive the session cookie jar or `localStorage`. This is not a multi-process sandbox.
 
-Built-in pages are `root://home`, `root://settings`, `root://security`, `root://history`, `root://downloads`, and `root://inspect`. `frontend/` is text with string replacements, plus the scripts in `frontend/scripts/`. It is not built by a Node toolchain.
+Built-in pages are `anvil://home`, `anvil://settings`, `anvil://security`, `anvil://history`, `anvil://downloads`, and `anvil://inspect`. `frontend/` is text with string replacements, plus the scripts in `frontend/scripts/`. It is not built by a Node toolchain.
 
 ## What this is not
 
 - The page is not rasterized on the GPU. Direct3D 11, when it is available, only presents the CPU buffer. If that device or `compositor.hlsl` fails to compile, Windows copies the same buffer with GDI.
-- Video frames are decoded on the CPU. There is no GPU decoder. Encrypted samples are AES-128-CTR from `root-cipher`.
+- Video frames are decoded on the CPU. There is no GPU decoder. Encrypted samples are AES-128-CTR from `anvil-cipher`.
 - `display: grid`, `var(--token)`, `ch`, `vw`, and `calc()` are not implemented.
 - One OS process does not stay open for each tab.
 
@@ -60,7 +60,7 @@ Linux draws with X11 and does HTTPS with OpenSSL (`libssl` / `libcrypto`). Windo
 
 On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries a 2 GiB address-space cap. `--tab-worker` asks for 256 MiB and exits if that cap does not stick.
 
-`profile.root` stores bookmarks, history, cookies, HSTS, settings, and origin-partitioned `localStorage`. Windows seals it with DPAPI. Linux seals it with AES-256-GCM. The Linux key file is `profile.key` in the same directory, mode 0600, written before the profile.
+`profile.anvil` stores bookmarks, history, cookies, HSTS, settings, and origin-partitioned `localStorage`. Windows seals it with DPAPI. Linux seals it with AES-256-GCM. The Linux key file is `profile.key` in the same directory, mode 0600, written before the profile.
 
 | Keys | Action |
 | --- | --- |
@@ -76,39 +76,39 @@ On Linux the window sets `PR_SET_NO_NEW_PRIVS`, turns core dumps off, and tries 
 
 | Path | What it is |
 | --- | --- |
-| `crates/root-dom` | HTML tree and selectors |
-| `crates/root-style` | CSS cascade and media queries |
-| `crates/root-layout` | Block, inline, flex, table, and positioned boxes |
-| `crates/root-paint` | Display list and zoom |
-| `crates/root-raster` | RGBA framebuffer and the optional C++20 scanline helpers |
-| `crates/root-script` | Budgeted script runtime and the optional numeric VM |
-| `crates/root-net` | HTTP, TLS, and the host block list |
-| `crates/root-sandbox` | Process limits and the `ROOTIPC1` frame format |
-| `crates/root-browser` | Window, pages, downloads, and `profile.root` |
+| `crates/anvil-dom` | HTML tree and selectors |
+| `crates/anvil-style` | CSS cascade and media queries |
+| `crates/anvil-layout` | Block, inline, flex, table, and positioned boxes |
+| `crates/anvil-paint` | Display list and zoom |
+| `crates/anvil-raster` | RGBA framebuffer and the optional C++20 scanline helpers |
+| `crates/anvil-script` | Budgeted script runtime and the optional numeric VM |
+| `crates/anvil-net` | HTTP, TLS, and the host block list |
+| `crates/anvil-sandbox` | Process limits and the `ANVILIPC` frame format |
+| `crates/anvil-browser` | Window, pages, downloads, and `profile.anvil` |
 | `frontend/` | Built-in page text and page scripts |
 
-`root-dom`, `root-style`, `root-layout`, `root-paint`, `root-raster`, and `root-script` are Apache-2.0. `root-net`, `root-sandbox`, `root-browser`, `frontend/`, and `assets/root-logo.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
+`anvil-dom`, `anvil-style`, `anvil-layout`, `anvil-paint`, `anvil-raster`, and `anvil-script` are Apache-2.0. `anvil-net`, `anvil-sandbox`, `anvil-browser`, `frontend/`, and `assets/anvil-logo.png` are all rights reserved. The text is in `LICENSE`, `LICENSE-APACHE`, `LICENSE-MPL`, and `LICENSE-PROPRIETARY`.
 
 ## Build
 
 Clone this repository and the seven libraries below as sibling directories.
 
 ```text
-../root-browser
-../root-cipher
-../root-compress
-../root-image
-../root-json
-../root-ttf
-../root-gpu
-../root-video
+../anvil-browser
+../anvil-cipher
+../anvil-compress
+../anvil-image
+../anvil-json
+../anvil-ttf
+../anvil-gpu
+../anvil-video
 ```
 
 Rust 1.85 or newer. A C++20 compiler is optional. If none is found, the C++ files are skipped and the Rust paths are used.
 
 ```text
 cargo test
-cargo run --release -p root-browser --bin root
+cargo run --release -p anvil-browser --bin root
 ```
 
 ```text
@@ -128,13 +128,13 @@ These are separate MPL-2.0 repositories. This browser does not vendor their sour
 
 | Repository | What it is |
 | --- | --- |
-| [root-cipher](https://github.com/buntatoes/root-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
-| [root-compress](https://github.com/buntatoes/root-compress) | DEFLATE, zlib, gzip |
-| [root-image](https://github.com/buntatoes/root-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
-| [root-json](https://github.com/buntatoes/root-json) | JSON |
-| [root-ttf](https://github.com/buntatoes/root-ttf) | TrueType and OpenType |
-| [root-gpu](https://github.com/buntatoes/root-gpu) | CPU drawing of boxes, shadows, and NV12. `compositor.hlsl` is source text compiled by the browser on Windows |
-| [root-video](https://github.com/buntatoes/root-video) | CPU frames in a small MP4 container |
+| [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
+| [anvil-compress](https://github.com/buntatoes/anvil-compress) | DEFLATE, zlib, gzip |
+| [anvil-image](https://github.com/buntatoes/anvil-image) | PNG, JPEG, GIF, WebP, ICO, BMP, PPM |
+| [anvil-json](https://github.com/buntatoes/anvil-json) | JSON |
+| [anvil-ttf](https://github.com/buntatoes/anvil-ttf) | TrueType and OpenType |
+| [anvil-gpu](https://github.com/buntatoes/anvil-gpu) | CPU drawing of boxes, shadows, and NV12. `compositor.hlsl` is source text compiled by the browser on Windows |
+| [anvil-video](https://github.com/buntatoes/anvil-video) | CPU frames in a small MP4 container |
 
 ## Author
 
