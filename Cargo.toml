@@ -15,7 +15,10 @@
 #   anvil-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
 # The seven libraries under [workspace.dependencies] are separate repositories
-# that sit next to this directory. anvil-cipher is linked only by anvil-browser
+# that sit next to this directory. A new library is a new repository, linked by
+# path, not a crates.io crate. A browser change that needs a library change is
+# tested and pushed to that library repository before this repository ships.
+# anvil-cipher is linked only by anvil-browser
 # on non-Windows targets (Linux profile sealing). Windows sealing uses DPAPI
 # inside anvil-browser and does not link anvil-cipher.
 #

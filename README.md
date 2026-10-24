@@ -126,6 +126,12 @@ root uninstall
 
 These are separate MPL-2.0 repositories. This browser does not vendor their source.
 
+A new library is its own repository, cloned next to this one and linked by path, the same way as the seven below. It is not a crates.io crate. Linux may keep using system libraries such as X11. Nothing else is added from outside.
+
+If a browser change needs a change in one of these libraries, that library change is tested, committed, and pushed to its own repository before the browser change is shipped. The browser is not shipped against a library edit that exists only on one machine. `cargo test` for every touched crate passes before either repository is updated.
+
+Source, tests, and release notes do not contain keys, tokens, or personal data.
+
 | Repository | What it is |
 | --- | --- |
 | [anvil-cipher](https://github.com/buntatoes/anvil-cipher) | AES-128, AES-256, CTR, AES-256-GCM |
