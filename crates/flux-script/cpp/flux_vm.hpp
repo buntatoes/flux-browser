@@ -581,8 +581,9 @@ struct FluxVmContext {
     void fill_telemetry(FluxVmTelemetryC* out) const noexcept;
 };
 
-// Compile source text into `ctx.program` and register functions in `ctx.heap`.
-bool compile_js_to_bytecode(FluxVmContext& ctx, const char* src, u32 len) noexcept;
+// Compile source text into `ctx.program`. `compiler_memory` is caller-owned
+// storage of `flux_cpp_vm_compiler_bytes` bytes. This is not a general compiler.
+bool compile_js_to_bytecode(FluxVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept;
 
 // Hash helper used across string pool and DOM selector IC.
 inline u64 fnv1a_hash_bytes(const char* data, u32 len) noexcept {

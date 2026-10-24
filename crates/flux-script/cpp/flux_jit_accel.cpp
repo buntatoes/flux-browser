@@ -510,39 +510,44 @@ i64 flux_cpp_jit_sum_range_i64(i64 start, i64 end_exclusive, i64 step) noexcept 
     return count * (start + last) / 2;
 }
 
-namespace {
+// The caller owns the context bytes. This file does not keep a process-global VM.
+extern "C" u32 flux_cpp_vm_context_bytes() {
+    return static_cast<u32>(sizeof(flux_vm::FluxVmContext));
+}
 
-// Reusable BSS-allocated VM context so freestanding builds (/Zl) never require
-// large stack frames or __chkstk symbols.
-flux_vm::FluxVmContext g_vm_ctx{};
+extern "C" u32 flux_cpp_vm_context_align() {
+    return static_cast<u32>(alignof(flux_vm::FluxVmContext));
+}
 
-} // namespace
-
-// Compile and execute a JavaScript snippet inside `FluxVmContext`
-// (NaN-boxed registers, `FluxShape` hidden classes, 4-way polymorphic Inline Caches,
-// and Mark-Sweep GC), returning numeric output and full VM telemetry to Rust.
+// Compile and execute a JavaScript snippet inside the caller-owned `FluxVmContext`.
+// Returns 1 when the numeric result is valid, 2 when the compiler accepted the
+// script and execution aborted, and 0 when the compiler rejected it.
+// This is not a general compiler.
 u32 flux_cpp_vm_run_script(
+    void* context_memory,
+    void* compiler_memory,
     const char* source_ptr,
     u32 source_len,
     flux_vm::FluxVmTelemetryC* telemetry_out,
     f64* numeric_result_out
 ) noexcept {
-    if (!source_ptr || source_len == 0u) {
+    if (!context_memory || !compiler_memory || !source_ptr || source_len == 0u) {
         return 0u;
     }
-    g_vm_ctx.init();
-    if (!flux_vm::compile_js_to_bytecode(g_vm_ctx, source_ptr, source_len)) {
+    auto& ctx = *static_cast<flux_vm::FluxVmContext*>(context_memory);
+    ctx.init();
+    if (!flux_vm::compile_js_to_bytecode(ctx, compiler_memory, source_ptr, source_len)) {
         return 0u;
     }
-    const flux_vm::FluxValue res = g_vm_ctx.execute(0u);
-    if (g_vm_ctx.aborted) {
-        return 0u;
-    }
+    const flux_vm::FluxValue res = ctx.execute(0u);
     if (telemetry_out) {
-        g_vm_ctx.fill_telemetry(telemetry_out);
+        ctx.fill_telemetry(telemetry_out);
     }
     if (numeric_result_out) {
         *numeric_result_out = res.as_number();
+    }
+    if (ctx.aborted) {
+        return 2u;
     }
     return 1u;
 }
@@ -550,9 +555,14 @@ u32 flux_cpp_vm_run_script(
 // Exercise hidden-class transitions, polymorphic Inline Caches, and Mark-Sweep GC
 // over `iterations` object allocations and property reads/writes.
 u32 flux_cpp_vm_run_ic_benchmark(
+    void* context_memory,
     u32 iterations,
     flux_vm::FluxVmTelemetryC* telemetry_out
 ) noexcept {
+    if (!context_memory) {
+        return 0u;
+    }
+    auto& g_vm_ctx = *static_cast<flux_vm::FluxVmContext*>(context_memory);
     g_vm_ctx.init();
 
     const u32 sym_x = g_vm_ctx.heap.intern_string("x", 1u);

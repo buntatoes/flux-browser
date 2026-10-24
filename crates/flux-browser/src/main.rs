@@ -4,8 +4,8 @@
 //! A window goes through `shell::open` on Windows and Linux. `render` prints
 //! a `flux-paint` display list. `raster` writes a PPM file with `flux-raster`.
 //! `--tab-worker` handles one `flux-sandbox` IPC frame in this process.
-//! Ordinary tab navigation does not start that worker. `Session::open_target`
-//! in `lib.rs` loads pages in the window process.
+//! An http(s) navigation in the window starts this mode, waits for one frame,
+//! and paints only when the frame says `ok`. `flux://` pages stay in the window.
 
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
@@ -18,10 +18,11 @@ use std::process::ExitCode;
 use flux_browser::installer::{install_default, uninstall_default};
 use flux_browser::{
     TabWorkerRequest, TabWorkerResponse, VERSION, Viewport, enforce_mandatory_sandbox_or_abort,
-    load_target, lock_current_worker_process_or_abort, render_html_with_resources_and_csp,
+    load_target, lock_current_worker_process_or_abort, render_html_with_resources_csp_and_storage,
 };
 use flux_paint::DisplayItem;
 use flux_raster::rasterize;
+use flux_sandbox::encode_ipc_frame;
 use flux_sandbox::{read_ipc_frame, write_ipc_frame};
 
 #[cfg(windows)]
@@ -55,7 +56,7 @@ fn run() -> Result<(), String> {
     match args.first().map(String::as_str) {
         // No arguments: empty window.
         None => open_window(&[]),
-        // One stdin frame in, one stdout frame out. Not started by normal browsing.
+        // One stdin frame in, one stdout frame out. The window starts this for http(s).
         Some("--tab-worker") => run_tab_worker(),
         // Print display-list lines. No window and no PPM file.
         Some("render") => render(&args[1..]),
@@ -116,36 +117,52 @@ fn run() -> Result<(), String> {
 /// Read one worker request, render it here, and write one response.
 ///
 /// `lock_current_worker_process_or_abort` applies the worker limits from
-/// `flux-sandbox`. The body is `render_html_with_resources_and_csp` with an
-/// empty stylesheet, an empty image map, and a 960 by 720 viewport. The CSP
-/// header and URL come from the request. The response is title, DOM node
-/// count, and blocked-resource count. This function does not open a window
-/// and does not read a second frame.
+/// `flux-sandbox`. Scripts run only when the request asks for them. The
+/// response HTML is the document after that step. This process owns its
+/// script runtime and does not receive the window's cookie jar. A response
+/// that does not fit in one `FLUXIPC1` frame is `ok: false` with an empty
+/// document. This function does not open a window and does not read a second
+/// frame.
 fn run_tab_worker() -> Result<(), String> {
     lock_current_worker_process_or_abort();
     let mut stdin = io::stdin().lock();
     let req_json = read_ipc_frame(&mut stdin).map_err(|e| e.to_string())?;
     let req = TabWorkerRequest::from_json(&req_json).map_err(|e| e.to_string())?;
-    let page = render_html_with_resources_and_csp(
+    let page = render_html_with_resources_csp_and_storage(
         &req.html,
         "",
         HashMap::new(),
         &req.url,
         Viewport {
-            width: 960.0,
-            height: 720.0,
+            width: req.viewport_width.max(1) as f32,
+            height: req.viewport_height.max(1) as f32,
         },
         req.csp_header.as_deref(),
         0,
+        &[],
+        None,
+        req.scripts_enabled,
     );
-    let resp = TabWorkerResponse {
+    let mut resp = TabWorkerResponse {
         tab_id: req.tab_id,
         ok: true,
-        title: page.title,
+        title: page.title.clone(),
         dom_nodes: page.document.node_count(),
         blocked_csp_resources: page.blocked_csp_count,
         error: None,
+        html: page.document.to_html(),
     };
+    if encode_ipc_frame(&resp.to_json()).is_err() {
+        resp = TabWorkerResponse {
+            tab_id: req.tab_id,
+            ok: false,
+            title: String::new(),
+            dom_nodes: 0,
+            blocked_csp_resources: 0,
+            error: Some("worker response exceeds the IPC cap".to_string()),
+            html: String::new(),
+        };
+    }
     let mut stdout = io::stdout().lock();
     write_ipc_frame(&mut stdout, &resp.to_json()).map_err(|e| e.to_string())
 }

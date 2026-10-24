@@ -5,8 +5,12 @@
 //! and writes one [`ComputedStyle`] per reachable node. flux-layout reads the
 //! [`StyleMap`] and places boxes. This crate does not lay out or paint.
 //!
-//! Lengths are `px` or `0`. Anything else is skipped, or becomes [`Size::Auto`].
-//! There is no grid, no `var(--token)`, no percentages, and no `em` / `rem`.
+//! `width`, `height`, `max-width`, and the offset properties keep `px`, `%`,
+//! `em`, and `rem`. Any other unit becomes [`Size::Auto`]. `font-size` accepts
+//! the same four units and resolves them here: `%` and `em` use the parent
+//! font size, and `rem` uses the `html` font size (16px until that element
+//! sets one). Margin, padding, border, and `gap` still accept only `px` and `0`.
+//! There is no grid and no `var(--token)`.
 //! `display` accepts `block`, `inline`, `flex`, and `none`. A descendant
 //! selector is whitespace between compounds. `>`, `+`, `~`, attribute
 //! selectors, and pseudo-classes are not parsed.
@@ -350,10 +354,21 @@ pub enum Display {
 /// `row-reverse` and `column-reverse` are not recognized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlexDirection {
-    /// Lay items out in a single horizontal line. Items do not wrap.
+    /// Lay items out on horizontal lines. [`FlexWrap`] decides whether they wrap.
     Row,
-    /// Lay items out in a single vertical line.
+    /// Lay items out in a single vertical line. Wrap and `flex-grow` are ignored.
     Column,
+}
+
+/// Whether a row flex container breaks items onto more than one line.
+/// The initial value is [`Self::NoWrap`]. `wrap-reverse` is not recognized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlexWrap {
+    /// Keep every item on one line, even when the line is wider than the container.
+    NoWrap,
+    /// Start a new line when the next item does not fit. A single item that is
+    /// wider than the container stays on its own line.
+    Wrap,
 }
 
 /// Main-axis packing for a flex line. Only one line is laid out.
@@ -406,13 +421,45 @@ pub enum Overflow {
     Hidden,
 }
 
-/// A used length. Percentages and other units are not represented; they parse as [`Self::Auto`].
+/// A length stored after parsing. [`Size::used_px`] turns it into CSS pixels.
+/// Units other than `px`, `%`, `em`, and `rem` are not represented; they parse
+/// as [`Self::Auto`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Size {
     /// The layout stage chooses the size.
     Auto,
     /// A CSS pixel length. Zero is allowed. Negative values are not rejected here.
     Px(f32),
+    /// A percentage of the containing block on the axis layout is resolving.
+    /// `50.0` means `50%`.
+    Percent(f32),
+    /// A multiple of the element's own font size. `2.0` means `2em`.
+    Em(f32),
+    /// A multiple of the root font size. `2.0` means `2rem`.
+    Rem(f32),
+}
+
+impl Size {
+    /// Used CSS pixels, or `None` when this length is [`Size::Auto`].
+    ///
+    /// `percent_basis` is the containing-block size on this axis, in CSS pixels.
+    /// A percentage needs a finite basis. `em_px` is this element's font size.
+    /// `rem_px` is the root font size from [`StyleMap::root_font_px`].
+    pub fn used_px(self, percent_basis: f32, em_px: f32, rem_px: f32) -> Option<f32> {
+        match self {
+            Size::Auto => None,
+            Size::Px(value) => Some(value),
+            Size::Percent(value) => {
+                if percent_basis.is_finite() {
+                    Some(percent_basis * value / 100.0)
+                } else {
+                    None
+                }
+            }
+            Size::Em(value) => Some(em_px * value),
+            Size::Rem(value) => Some(rem_px * value),
+        }
+    }
 }
 
 /// Four CSS pixel edges, clockwise from the top. Not a percentage.
@@ -470,7 +517,8 @@ pub struct LinearGradient {
 /// Used values for one element after the user-agent defaults, the cascade,
 /// and the inline `style` attribute.
 ///
-/// Lengths are CSS pixels. `background` is `None` when no solid color was set.
+/// `width`, `height`, `max-width`, and offsets may still be `%`, `em`, or `rem`.
+/// `font-size` is already in CSS pixels. `background` is `None` when no solid color was set.
 /// `background_gradient` is independent and, when set, also stores its first
 /// stop in `background`. `box_shadow` is `None` when unset or `none`.
 /// Inherited on elements: `color`, `font_size`, and `underline`. A child's
@@ -502,6 +550,10 @@ pub struct ComputedStyle {
     pub max_width: Size,
     pub underline: bool,
     pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    /// Main-size growth factor for a flex item. The initial value is 0.
+    /// This is not inherited. Negative values are stored as 0. Column flex ignores it.
+    pub flex_grow: f32,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
     pub gap: f32,
@@ -536,6 +588,8 @@ impl ComputedStyle {
             max_width: Size::Auto,
             underline: false,
             flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::NoWrap,
+            flex_grow: 0.0,
             justify_content: JustifyContent::Start,
             align_items: AlignItems::Stretch,
             gap: 0.0,
@@ -560,6 +614,7 @@ impl ComputedStyle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleMap {
     styles: Vec<ComputedStyle>,
+    root_font_px: f32,
 }
 
 impl StyleMap {
@@ -567,6 +622,12 @@ impl StyleMap {
     /// style, not an error. The reference lives as long as `self`.
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         self.styles.get(id.index()).unwrap_or(&FALLBACK)
+    }
+
+    /// Computed `font-size` of the `html` element, in CSS pixels.
+    /// `rem` uses this value. It stays 16 when `html` does not set a font size.
+    pub fn root_font_px(&self) -> f32 {
+        self.root_font_px
     }
 }
 
@@ -662,15 +723,23 @@ pub fn compute_styles_with_viewport(
     viewport_width: f32,
 ) -> StyleMap {
     let mut styles = vec![ComputedStyle::initial(); doc_len(doc)];
+    let mut root_font_px = 16.0_f32;
     walk(
         doc,
         doc.root(),
         &ComputedStyle::initial(),
         sheet,
         viewport_width,
+        &mut root_font_px,
         &mut styles,
     );
-    StyleMap { styles }
+    if let Some(html_style) = styles.get(doc.html().index()) {
+        root_font_px = html_style.font_size;
+    }
+    StyleMap {
+        styles,
+        root_font_px,
+    }
 }
 
 /// One past the largest node index reachable from the root.
@@ -697,17 +766,30 @@ fn walk(
     parent: &ComputedStyle,
     sheet: &Stylesheet,
     viewport_width: f32,
+    root_font_px: &mut f32,
     out: &mut [ComputedStyle],
 ) {
+    let parent_font_px = parent.font_size;
     let style = match doc.get(id).data() {
         NodeData::Element { tag, .. } => {
             let mut style = parent.inherited_child();
             apply_user_agent(&mut style, tag);
-            apply_author(&mut style, doc, id, sheet, viewport_width);
+            apply_author(
+                &mut style,
+                doc,
+                id,
+                sheet,
+                viewport_width,
+                parent_font_px,
+                *root_font_px,
+            );
             if let Some(inline_css) = doc.get(id).data().attr("style") {
                 for declaration in parse_declarations(inline_css) {
-                    apply_declaration(&mut style, &declaration);
+                    apply_declaration(&mut style, &declaration, parent_font_px, *root_font_px);
                 }
+            }
+            if tag == "html" {
+                *root_font_px = style.font_size;
             }
             style
         }
@@ -718,7 +800,7 @@ fn walk(
     }
     let children: Vec<NodeId> = doc.children(id).to_vec();
     for child in children {
-        walk(doc, child, &style, sheet, viewport_width, out);
+        walk(doc, child, &style, sheet, viewport_width, root_font_px, out);
     }
 }
 
@@ -733,6 +815,8 @@ fn apply_author(
     id: NodeId,
     sheet: &Stylesheet,
     viewport_width: f32,
+    parent_font_px: f32,
+    root_font_px: f32,
 ) {
     let mut matched = Vec::new();
     for (order, rule) in sheet.rules.iter().enumerate() {
@@ -754,7 +838,7 @@ fn apply_author(
     matched.sort_by_key(|(specificity, order, _)| (*specificity, *order));
     for (_, _, rule) in matched {
         for declaration in &rule.declarations {
-            apply_declaration(style, declaration);
+            apply_declaration(style, declaration, parent_font_px, root_font_px);
         }
     }
 }
@@ -931,11 +1015,18 @@ fn is_block_tag(tag: &str) -> bool {
 
 /// Apply one declaration. Unknown properties and unparsed values are ignored.
 ///
-/// `display: grid` and `var(--token)` are unknown and do nothing. Lengths that
-/// are not `px` or `0` are ignored, except `width`, `height`, `max-width`,
-/// and the offset properties, which become [`Size::Auto`]. `overflow` values
-/// `scroll` and `auto` are stored as [`Overflow::Hidden`].
-fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
+/// `display: grid` and `var(--token)` are unknown and do nothing. On `width`,
+/// `height`, `max-width`, and the offsets, a unit other than `px`, `%`, `em`,
+/// or `rem` becomes [`Size::Auto`]. `font-size` resolves `%` and `em` against
+/// `parent_font_px`, and `rem` against `root_font_px`. Margin, padding, border,
+/// and `gap` still accept only `px` and `0`. `overflow` values `scroll` and
+/// `auto` are stored as [`Overflow::Hidden`].
+fn apply_declaration(
+    style: &mut ComputedStyle,
+    declaration: &Declaration,
+    parent_font_px: f32,
+    root_font_px: f32,
+) {
     let value = declaration.value.trim();
     match declaration.name.as_str() {
         "display" => {
@@ -972,8 +1063,8 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
             }
         }
         "font-size" => {
-            if let Some(size) = parse_px(value) {
-                style.font_size = size;
+            if let Some(size) = parse_font_size(value, parent_font_px, root_font_px) {
+                style.font_size = size.max(0.0);
             }
         }
         "text-decoration" => {
@@ -1118,6 +1209,20 @@ fn apply_declaration(style: &mut ComputedStyle, declaration: &Declaration) {
                 _ => return,
             };
         }
+        "flex-wrap" => {
+            style.flex_wrap = match value {
+                "wrap" => FlexWrap::Wrap,
+                "nowrap" => FlexWrap::NoWrap,
+                _ => return,
+            };
+        }
+        "flex-grow" => {
+            if let Ok(grow) = value.parse::<f32>() {
+                if grow.is_finite() {
+                    style.flex_grow = grow.max(0.0);
+                }
+            }
+        }
         "justify-content" => {
             style.justify_content = match value {
                 "flex-start" | "start" => JustifyContent::Start,
@@ -1218,14 +1323,49 @@ fn split_css_tokens(value: &str) -> Vec<&str> {
     out
 }
 
-/// `auto`, `none`, or a non-pixel length becomes [`Size::Auto`]. A `px` length
-/// or `0` becomes [`Size::Px`].
+/// `auto` and `none` become [`Size::Auto`]. `px`, `%`, `em`, `rem`, and `0`
+/// keep their unit. Any other unit becomes [`Size::Auto`].
 fn parse_size(value: &str) -> Size {
-    if value == "auto" || value == "none" {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("none") {
         Size::Auto
     } else {
-        parse_px(value).map(Size::Px).unwrap_or(Size::Auto)
+        parse_length(value).unwrap_or(Size::Auto)
     }
+}
+
+/// `0`, or a number with a `px`, `%`, `em`, or `rem` suffix. `rem` is matched
+/// before `em`. Other units, including a bare number other than `0`, return `None`.
+fn parse_length(value: &str) -> Option<Size> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(Size::Px(0.0));
+    }
+    if let Some(num) = value.strip_suffix("rem") {
+        return num.trim().parse::<f32>().ok().map(Size::Rem);
+    }
+    if let Some(num) = value.strip_suffix("em") {
+        return num.trim().parse::<f32>().ok().map(Size::Em);
+    }
+    if let Some(num) = value.strip_suffix("px") {
+        return num.trim().parse::<f32>().ok().map(Size::Px);
+    }
+    if let Some(num) = value.strip_suffix('%') {
+        return num.trim().parse::<f32>().ok().map(Size::Percent);
+    }
+    None
+}
+
+/// Resolve `font-size`. `%` and `em` use the parent font size. `rem` uses the
+/// root font size. `px` and `0` are already pixels. Other units return `None`.
+fn parse_font_size(value: &str, parent_px: f32, root_px: f32) -> Option<f32> {
+    Some(match parse_length(value)? {
+        Size::Px(value) => value,
+        Size::Em(value) => parent_px * value,
+        Size::Rem(value) => root_px * value,
+        Size::Percent(value) => parent_px * value / 100.0,
+        Size::Auto => return None,
+    })
 }
 
 /// One to four pixel lengths into an [`Edge`], using the CSS shorthand cycle.
@@ -1259,14 +1399,13 @@ fn parse_edge(value: &str) -> Option<Edge> {
     })
 }
 
-/// Parse `0` or a number with a `px` suffix. Other units, including bare
-/// numbers other than `0`, return `None`.
+/// Parse `0` or a number with a `px` suffix. `%`, `em`, `rem`, and other units
+/// return `None`, so margin, padding, border, and `gap` leave the previous value.
 fn parse_px(value: &str) -> Option<f32> {
-    let value = value.trim();
-    if value == "0" {
-        return Some(0.0);
+    match parse_length(value) {
+        Some(Size::Px(value)) => Some(value),
+        _ => None,
     }
-    value.strip_suffix("px")?.parse().ok()
 }
 
 /// Parse `offset-x offset-y blur spread color`. At least two lengths are required.
@@ -1705,5 +1844,31 @@ mod tests {
         let mobile = compute_styles_with_viewport(&doc, &sheet, 480.0);
         assert_eq!(mobile.get(box_id).width, Size::Px(320.0));
         assert_eq!(mobile.get(box_id).color, Color::parse("#e8c37a").unwrap());
+    }
+
+    #[test]
+    fn keeps_px_percent_em_and_rem_and_drops_other_units() {
+        let doc = parse_html("<div id=\"box\"><div id=\"child\"></div></div>");
+        let sheet = parse_css(
+            "html { font-size: 20px; }
+             #box { font-size: 2rem; width: 50%; height: 1.5em; flex-wrap: wrap; }
+             #child { width: 10vw; max-width: 4rem; top: 25%; font-size: 50%; flex-grow: 2; }",
+        );
+        let styles = compute_styles(&doc, &sheet);
+        let box_id = doc.get_element_by_id("box").unwrap();
+        let child = doc.get_element_by_id("child").unwrap();
+        assert_eq!(styles.root_font_px(), 20.0);
+        assert_eq!(styles.get(box_id).font_size, 40.0);
+        assert_eq!(styles.get(box_id).width, Size::Percent(50.0));
+        assert_eq!(styles.get(box_id).height, Size::Em(1.5));
+        assert_eq!(styles.get(box_id).flex_wrap, FlexWrap::Wrap);
+        assert_eq!(styles.get(child).width, Size::Auto);
+        assert_eq!(styles.get(child).max_width, Size::Rem(4.0));
+        assert_eq!(styles.get(child).top, Size::Percent(25.0));
+        assert_eq!(styles.get(child).font_size, 20.0);
+        assert_eq!(styles.get(child).flex_grow, 2.0);
+        assert_eq!(Size::Percent(50.0).used_px(200.0, 16.0, 16.0), Some(100.0));
+        assert_eq!(Size::Em(2.0).used_px(0.0, 30.0, 16.0), Some(60.0));
+        assert_eq!(Size::Rem(1.5).used_px(0.0, 30.0, 20.0), Some(30.0));
     }
 }

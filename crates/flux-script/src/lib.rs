@@ -5,6 +5,11 @@
 //! script text with [`ScriptRuntime::eval_script`], and runs inline scripts with
 //! [`ScriptRuntime::run_document_scripts`].
 //!
+//! `fetch()` is same-origin only. The Rust interpreter performs it. A registered
+//! mock wins over the host. Otherwise the interpreter calls the host callback
+//! installed by `flux-browser`, which uses `flux-net`. This crate does not open
+//! a socket. The C++20 numeric VM does not perform `fetch()`.
+//!
 //! When `build.rs` compiles the freestanding C++20 translation units under `cpp/`
 //! (`flux_vm_heap.cpp`, `flux_vm_ic.cpp`, `flux_vm_compiler.cpp`, `flux_jit_accel.cpp`),
 //! it sets `cfg(flux_cpp_jit)` and links the C++20 `FluxVM` engine (64-bit NaN-boxed
@@ -12,9 +17,67 @@
 //! garbage collection, register bytecode execution, and vector reduction kernels).
 //! If no C++20 compiler is present at build time, `flux-script` falls back cleanly
 //! to its pure-Rust execution path.
+//!
+//! [`ScriptRuntime::eval_script`] uses that VM only when the compiler accepts
+//! the script and the script does not touch the DOM, `fetch()`, or storage.
+//! That is not a general compiler. Every other script stays on the Rust interpreter.
+//! The caller owns the VM context. There is no process-global VM.
+
+use std::sync::Arc;
 
 use flux_dom::{Document, NodeId};
 use flux_json::{JsonValue, parse_json, to_json_string};
+
+/// Maximum bytes of a `fetch()` body kept by the interpreter.
+///
+/// A longer body is cut on a character boundary. `flux-net` also stops reading
+/// a response at its own raw cap before this host callback returns.
+pub const MAX_SCRIPT_FETCH_BODY: usize = 64 * 1024;
+
+/// Status and body returned by a `fetch()` host callback.
+///
+/// `status` is the HTTP status, `0` when the host did not complete a response,
+/// or `403` when the interpreter blocked the URL before calling the host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptFetchReply {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Host callback for same-origin `fetch()`. The first argument is an absolute
+/// URL. The second is the page URL. The interpreter does not call this for a
+/// cross-origin URL or for a URL that has a registered mock.
+#[derive(Clone, Default)]
+struct FetchHost {
+    inner: Option<Arc<dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync>>,
+}
+
+impl PartialEq for FetchHost {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.is_some() == other.inner.is_some()
+    }
+}
+
+impl std::fmt::Debug for FetchHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FetchHost")
+            .field("set", &self.inner.is_some())
+            .finish()
+    }
+}
+
+/// Cut `body` to [`MAX_SCRIPT_FETCH_BODY`] on a character boundary.
+pub fn limit_script_fetch_body(body: &mut String) {
+    if body.len() <= MAX_SCRIPT_FETCH_BODY {
+        return;
+    }
+    let mut end = MAX_SCRIPT_FETCH_BODY;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body.truncate(end);
+}
 
 /// Built-in JavaScript core standard library prelude (`crates/flux-script/js/runtime_core.js`).
 pub const RUNTIME_CORE_JS: &str = include_str!("../js/runtime_core.js");
@@ -43,13 +106,23 @@ unsafe extern "C" {
     fn flux_cpp_jit_kernel_version() -> u32;
     fn flux_cpp_jit_eval_binary(opcode: u32, lhs: f64, rhs: f64) -> f64;
     fn flux_cpp_jit_sum_range_i64(start: i64, end_exclusive: i64, step: i64) -> i64;
+    fn flux_cpp_vm_context_bytes() -> u32;
+    fn flux_cpp_vm_context_align() -> u32;
+    fn flux_cpp_vm_compiler_bytes() -> u32;
+    fn flux_cpp_vm_compiler_align() -> u32;
     fn flux_cpp_vm_run_script(
+        context: *mut u8,
+        compiler: *mut u8,
         source_ptr: *const u8,
         source_len: u32,
         telemetry_out: *mut FluxVmTelemetry,
         numeric_result_out: *mut f64,
     ) -> u32;
-    fn flux_cpp_vm_run_ic_benchmark(iterations: u32, telemetry_out: *mut FluxVmTelemetry) -> u32;
+    fn flux_cpp_vm_run_ic_benchmark(
+        context: *mut u8,
+        iterations: u32,
+        telemetry_out: *mut FluxVmTelemetry,
+    ) -> u32;
     fn flux_cpp_vm_vector_reduce(op: u32, data_ptr: *const f64, len: u32) -> f64;
 }
 
@@ -65,9 +138,125 @@ pub fn is_cpp_jit_kernel_active() -> bool {
     }
 }
 
-/// Compile and execute a self-contained JS script inside the C++20 `FluxVM`
-/// (NaN-boxed registers, `FluxShape` hidden classes, 4-way polymorphic Inline Caches,
-/// and Mark-Sweep GC), returning `(numeric_result, telemetry)`.
+/// Caller-owned numeric VM memory. A clone does not share the allocation.
+#[cfg(flux_cpp_jit)]
+struct VmOwner {
+    context: *mut u8,
+    context_layout: std::alloc::Layout,
+    compiler: *mut u8,
+    compiler_layout: std::alloc::Layout,
+}
+
+#[cfg(flux_cpp_jit)]
+impl VmOwner {
+    fn empty() -> Self {
+        Self {
+            context: std::ptr::null_mut(),
+            context_layout: std::alloc::Layout::from_size_align(1, 1).unwrap(),
+            compiler: std::ptr::null_mut(),
+            compiler_layout: std::alloc::Layout::from_size_align(1, 1).unwrap(),
+        }
+    }
+
+    fn ensure(&mut self) -> bool {
+        unsafe {
+            if self.context.is_null() {
+                let Some((layout, ptr)) = alloc_vm_bytes(
+                    flux_cpp_vm_context_bytes() as usize,
+                    flux_cpp_vm_context_align() as usize,
+                ) else {
+                    return false;
+                };
+                self.context_layout = layout;
+                self.context = ptr;
+            }
+            if self.compiler.is_null() {
+                let Some((layout, ptr)) = alloc_vm_bytes(
+                    flux_cpp_vm_compiler_bytes() as usize,
+                    flux_cpp_vm_compiler_align() as usize,
+                ) else {
+                    return false;
+                };
+                self.compiler_layout = layout;
+                self.compiler = ptr;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(flux_cpp_jit)]
+impl Drop for VmOwner {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.context.is_null() {
+                std::alloc::dealloc(self.context, self.context_layout);
+            }
+            if !self.compiler.is_null() {
+                std::alloc::dealloc(self.compiler, self.compiler_layout);
+            }
+        }
+    }
+}
+
+#[cfg(flux_cpp_jit)]
+impl Clone for VmOwner {
+    fn clone(&self) -> Self {
+        Self::empty()
+    }
+}
+
+#[cfg(flux_cpp_jit)]
+impl PartialEq for VmOwner {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(flux_cpp_jit)]
+impl std::fmt::Debug for VmOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VmOwner")
+            .field("ready", &!self.context.is_null())
+            .finish()
+    }
+}
+
+#[cfg(flux_cpp_jit)]
+unsafe impl Send for VmOwner {}
+
+#[cfg(flux_cpp_jit)]
+fn alloc_vm_bytes(bytes: usize, align: usize) -> Option<(std::alloc::Layout, *mut u8)> {
+    let align = align.max(1);
+    let mut size = bytes.max(1);
+    let rem = size % align;
+    if rem != 0 {
+        size = size.saturating_add(align - rem);
+    }
+    let layout = std::alloc::Layout::from_size_align(size, align).ok()?;
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some((layout, ptr))
+    }
+}
+
+#[cfg(not(flux_cpp_jit))]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct VmOwner;
+
+#[cfg(not(flux_cpp_jit))]
+impl VmOwner {
+    fn empty() -> Self {
+        Self
+    }
+}
+
+/// Compile and execute a self-contained JS script inside a caller-owned C++20
+/// `FluxVM`, returning `(numeric_result, telemetry)`. The compiler subset is
+/// numeric. This is not a general compiler.
 pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, FluxVmTelemetry)> {
     let trimmed = source.trim();
     if trimmed.is_empty() {
@@ -75,9 +264,15 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, FluxVmTelemetry)> {
     }
     #[cfg(flux_cpp_jit)]
     unsafe {
+        let mut owner = VmOwner::empty();
+        if !owner.ensure() {
+            return None;
+        }
         let mut telemetry = FluxVmTelemetry::default();
         let mut result = 0.0_f64;
         let ok = flux_cpp_vm_run_script(
+            owner.context,
+            owner.compiler,
             trimmed.as_ptr(),
             trimmed.len() as u32,
             &mut telemetry,
@@ -102,11 +297,13 @@ pub fn eval_cpp_vm_script(source: &str) -> Option<(f64, FluxVmTelemetry)> {
 pub fn run_cpp_vm_ic_benchmark(iterations: u32) -> (u32, FluxVmTelemetry) {
     #[cfg(flux_cpp_jit)]
     unsafe {
-        let mut telemetry = FluxVmTelemetry::default();
-        let checksum = flux_cpp_vm_run_ic_benchmark(iterations, &mut telemetry);
-        return (checksum, telemetry);
+        let mut owner = VmOwner::empty();
+        if owner.ensure() {
+            let mut telemetry = FluxVmTelemetry::default();
+            let checksum = flux_cpp_vm_run_ic_benchmark(owner.context, iterations, &mut telemetry);
+            return (checksum, telemetry);
+        }
     }
-    #[cfg(not(flux_cpp_jit))]
     {
         let capped = iterations.clamp(16, 4096);
         let mut acc = 0i32;
@@ -258,8 +455,16 @@ pub const MAX_TIMERS: usize = 64;
 /// Maximum queued Promise / `queueMicrotask` callbacks per turn.
 pub const MAX_MICROTASKS: usize = 128;
 
-/// Maximum key-value entries per origin in `localStorage` or `sessionStorage`.
+/// Maximum stored rows in one `localStorage` or `sessionStorage` list.
+///
+/// This is the whole list, not one origin. A new row past this length is ignored.
 pub const MAX_STORAGE_ENTRIES: usize = 256;
+
+/// Maximum UTF-8 bytes of keys plus values stored for one origin.
+///
+/// A `setItem` that would pass this cap does not run. The previous value stays.
+/// `sessionStorage` uses the same cap and is not written to `profile.flx`.
+pub const MAX_STORAGE_ORIGIN_BYTES: usize = 64 * 1024;
 
 /// Value carried by the interpreter.
 #[derive(Clone, Debug, PartialEq)]
@@ -363,6 +568,7 @@ pub struct ScriptRuntime {
     local_storage: Vec<(String, String, String)>,
     session_storage: Vec<(String, String, String)>,
     fetch_mocks: Vec<(String, u16, String)>,
+    fetch_host: FetchHost,
     console_logs: Vec<String>,
     dom_cache: Vec<(String, NodeId)>,
     jit_stats: JitStats,
@@ -370,6 +576,10 @@ pub struct ScriptRuntime {
     pending_navigation: Option<String>,
     page_origin: Option<String>,
     prelude_loaded: bool,
+    last_script_used_vm: bool,
+    last_vm_number: Option<f64>,
+    in_rust_eval: bool,
+    vm_owner: VmOwner,
     steps: usize,
     call_depth: usize,
     aborted: bool,
@@ -386,6 +596,7 @@ impl Default for ScriptRuntime {
             local_storage: Vec::new(),
             session_storage: Vec::new(),
             fetch_mocks: Vec::new(),
+            fetch_host: FetchHost::default(),
             console_logs: Vec::new(),
             dom_cache: Vec::new(),
             jit_stats: JitStats::default(),
@@ -393,6 +604,10 @@ impl Default for ScriptRuntime {
             pending_navigation: None,
             page_origin: None,
             prelude_loaded: false,
+            last_script_used_vm: false,
+            last_vm_number: None,
+            in_rust_eval: false,
+            vm_owner: VmOwner::empty(),
             steps: 0,
             call_depth: 0,
             aborted: false,
@@ -469,12 +684,15 @@ impl ScriptRuntime {
     }
 
     /// Import persisted `(origin, key, value)` `localStorage` entries from `profile.flx`.
+    ///
+    /// Rows past the list cap are ignored. A row that would pass the per-origin
+    /// byte cap is ignored, and an earlier value for that key stays.
     pub fn import_local_storage(&mut self, entries: &[(String, String, String)]) {
-        self.local_storage = entries
-            .iter()
-            .take(MAX_STORAGE_ENTRIES * 8)
-            .cloned()
-            .collect();
+        let mut next = Vec::new();
+        for (origin, key, value) in entries.iter().take(MAX_STORAGE_ENTRIES * 8) {
+            storage_put(&mut next, origin, key, value);
+        }
+        self.local_storage = next;
     }
 
     /// Read a key from the active origin's `localStorage`.
@@ -487,20 +705,12 @@ impl ScriptRuntime {
     }
 
     /// Write a key-value pair into the active origin's `localStorage`.
+    ///
+    /// A write that would pass [`MAX_STORAGE_ORIGIN_BYTES`] does not change the
+    /// stored value. A new row past the list cap is ignored.
     pub fn local_storage_set(&mut self, key: &str, value: &str) {
         let origin = self.storage_origin_key();
-        if let Some((_, _, slot)) = self
-            .local_storage
-            .iter_mut()
-            .find(|(o, k, _)| o == &origin && k == key)
-        {
-            *slot = value.to_string();
-            return;
-        }
-        if self.local_storage.len() < MAX_STORAGE_ENTRIES * 8 {
-            self.local_storage
-                .push((origin, key.to_string(), value.to_string()));
-        }
+        storage_put(&mut self.local_storage, &origin, key, value);
     }
 
     /// Remove a key from the active origin's `localStorage`.
@@ -518,6 +728,20 @@ impl ScriptRuntime {
 
     pub fn was_aborted(&self) -> bool {
         self.aborted
+    }
+
+    /// True when the previous [`Self::eval_script`] call ran on the numeric VM.
+    ///
+    /// A script that touches the DOM, `fetch()`, or storage stays on the Rust
+    /// interpreter, so this is false. A script the compiler rejects is also false.
+    pub fn last_script_used_vm(&self) -> bool {
+        self.last_script_used_vm
+    }
+
+    /// Numeric result of the previous VM-backed [`Self::eval_script`], if that
+    /// path ran and the compiler accepted the script.
+    pub fn last_vm_number(&self) -> Option<f64> {
+        self.last_vm_number
     }
 
     pub fn reset_execution_budget(&mut self) {
@@ -547,8 +771,9 @@ impl ScriptRuntime {
         self.prelude_loaded = true;
         let saved_steps = self.steps;
         let saved_blocks = self.jit_stats.compiled_blocks;
-        self.eval_script(doc, RUNTIME_CORE_JS);
-        self.eval_script(doc, RUNTIME_ASYNC_WEB_JS);
+        // The prelude installs host functions. It stays on the Rust interpreter.
+        self.eval_rust_script(doc, RUNTIME_CORE_JS);
+        self.eval_rust_script(doc, RUNTIME_ASYNC_WEB_JS);
         self.steps = saved_steps;
         self.jit_stats.compiled_blocks = saved_blocks;
         self.aborted = false;
@@ -557,6 +782,17 @@ impl ScriptRuntime {
     pub fn register_fetch_response(&mut self, url: &str, status: u16, body: &str) {
         self.fetch_mocks
             .push((url.to_string(), status, body.to_string()));
+    }
+
+    /// Install the same-origin `fetch()` host. A later call replaces it.
+    ///
+    /// The host is not used for a cross-origin URL or for a URL passed to
+    /// [`Self::register_fetch_response`]. The numeric VM does not call it.
+    pub fn set_fetch_host(
+        &mut self,
+        host: Arc<dyn Fn(&str, &str) -> ScriptFetchReply + Send + Sync>,
+    ) {
+        self.fetch_host.inner = Some(host);
     }
 
     /// Drain all queued Promise / `queueMicrotask` callbacks in FIFO order.
@@ -647,6 +883,33 @@ impl ScriptRuntime {
         if self.aborted {
             return;
         }
+        self.last_script_used_vm = false;
+        self.last_vm_number = None;
+        let cleaned = strip_comments(source);
+        // Nested calls are loop bodies and function bodies. They share the Rust
+        // variable environment, so they stay on the Rust interpreter.
+        if !self.in_rust_eval && !script_stays_on_rust(&cleaned) {
+            match self.try_owned_vm(&cleaned) {
+                VmRun::Value(number) => {
+                    self.last_script_used_vm = true;
+                    self.last_vm_number = Some(number);
+                    return;
+                }
+                VmRun::Aborted => {
+                    self.last_script_used_vm = true;
+                    self.aborted = true;
+                    return;
+                }
+                VmRun::Rejected => {}
+            }
+        }
+        let outer = self.in_rust_eval;
+        self.in_rust_eval = true;
+        self.eval_rust_script(doc, &cleaned);
+        self.in_rust_eval = outer;
+    }
+
+    fn eval_rust_script(&mut self, doc: &mut Document, source: &str) {
         let cleaned = strip_comments(source);
         let statements = split_statements(&cleaned);
         for stmt in &statements {
@@ -672,6 +935,41 @@ impl ScriptRuntime {
                     self.exec_statement(doc, &stmt);
                 }
             }
+        }
+    }
+
+    fn try_owned_vm(&mut self, source: &str) -> VmRun {
+        let trimmed = source.trim();
+        if trimmed.is_empty() || trimmed.len() > u32::MAX as usize {
+            return VmRun::Rejected;
+        }
+        #[cfg(flux_cpp_jit)]
+        {
+            if !is_cpp_jit_kernel_active() || !self.vm_owner.ensure() {
+                return VmRun::Rejected;
+            }
+            let mut result = 0.0_f64;
+            let mut telemetry = FluxVmTelemetry::default();
+            let code = unsafe {
+                flux_cpp_vm_run_script(
+                    self.vm_owner.context,
+                    self.vm_owner.compiler,
+                    trimmed.as_ptr(),
+                    trimmed.len() as u32,
+                    &mut telemetry,
+                    &mut result,
+                )
+            };
+            return match code {
+                1 => VmRun::Value(result),
+                2 => VmRun::Aborted,
+                _ => VmRun::Rejected,
+            };
+        }
+        #[cfg(not(flux_cpp_jit))]
+        {
+            let _ = (self, trimmed);
+            VmRun::Rejected
         }
     }
 
@@ -1621,19 +1919,34 @@ impl ScriptRuntime {
                 );
                 return Value::Json(obj);
             }
-            let (status, body) = self
+            if let Some((status, body)) = self
                 .fetch_mocks
                 .iter()
                 .rev()
-                .find(|(u, _, _)| u == &url)
-                .map(|(_, s, b)| (*s, b.clone()))
-                .unwrap_or((200, "{}".to_string()));
-            let mut obj = JsonValue::empty_object();
-            obj.insert("url", JsonValue::String(url));
-            obj.insert("status", JsonValue::Number(status as f64));
-            obj.insert("ok", JsonValue::Bool((200..300).contains(&status)));
-            obj.insert("body", JsonValue::String(body));
-            return Value::Json(obj);
+                .find(|(registered, _, _)| registered == &url)
+                .map(|(_, status, body)| (*status, body.clone()))
+            {
+                return fetch_result_value(&url, status, body);
+            }
+            // The step budget is spent before the host runs, so a spent budget
+            // does not open a socket.
+            if !self.consume_step() {
+                return fetch_result_value(&url, 0, String::new());
+            }
+            let page = self.page_origin.clone().unwrap_or_default();
+            let absolute = resolve_script_fetch_url(&page, &url);
+            let Some(host) = self.fetch_host.inner.clone() else {
+                return fetch_result_value(&url, 200, "{}".to_string());
+            };
+            let mut reply = host(&absolute, &page);
+            limit_script_fetch_body(&mut reply.body);
+            let extra_steps = reply.body.len() / 1024;
+            for _ in 0..extra_steps {
+                if !self.consume_step() {
+                    break;
+                }
+            }
+            return fetch_result_value(&url, reply.status, reply.body);
         }
 
         if let Some((obj_expr, method)) = callee.rsplit_once('.') {
@@ -1689,15 +2002,7 @@ impl ScriptRuntime {
                     "setItem" if args.len() >= 2 => {
                         let key = self.eval_expr(doc, &args[0]).as_string(doc);
                         let val = self.eval_expr(doc, &args[1]).as_string(doc);
-                        if let Some((_, _, slot)) = self
-                            .session_storage
-                            .iter_mut()
-                            .find(|(o, k, _)| o == &origin && k == &key)
-                        {
-                            *slot = val;
-                        } else if self.session_storage.len() < MAX_STORAGE_ENTRIES * 8 {
-                            self.session_storage.push((origin, key, val));
-                        }
+                        storage_put(&mut self.session_storage, &origin, &key, &val);
                         Value::Null
                     }
                     "removeItem" if !args.is_empty() => {
@@ -2284,6 +2589,125 @@ fn extract_single_param_callback(handler_raw: &str) -> (String, String) {
         return (param, block);
     }
     (String::new(), handler_raw.to_string())
+}
+
+/// Bytes of keys plus values already stored for `origin`.
+fn storage_origin_bytes(rows: &[(String, String, String)], origin: &str) -> usize {
+    rows.iter()
+        .filter(|(stored_origin, _, _)| stored_origin == origin)
+        .map(|(_, key, value)| key.len().saturating_add(value.len()))
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Insert or replace one storage row when the origin byte cap allows it.
+///
+/// An update that does not fit leaves the previous value. A new key that does
+/// not fit is not added. The list length cap still applies to new rows.
+fn storage_put(rows: &mut Vec<(String, String, String)>, origin: &str, key: &str, value: &str) {
+    if let Some(index) = rows
+        .iter()
+        .position(|(stored_origin, stored_key, _)| stored_origin == origin && stored_key == key)
+    {
+        let next = storage_origin_bytes(rows, origin)
+            .saturating_sub(rows[index].2.len())
+            .saturating_add(value.len());
+        if next > MAX_STORAGE_ORIGIN_BYTES {
+            return;
+        }
+        rows[index].2 = value.to_string();
+        return;
+    }
+    let next = storage_origin_bytes(rows, origin)
+        .saturating_add(key.len())
+        .saturating_add(value.len());
+    if next > MAX_STORAGE_ORIGIN_BYTES {
+        return;
+    }
+    if rows.len() < MAX_STORAGE_ENTRIES * 8 {
+        rows.push((origin.to_string(), key.to_string(), value.to_string()));
+    }
+}
+
+/// Result of offering a script to the caller-owned numeric VM.
+enum VmRun {
+    /// The compiler accepted the script and execution finished.
+    Value(f64),
+    /// The compiler accepted the script and the step budget aborted it.
+    Aborted,
+    /// The compiler rejected the script, or the VM is not linked.
+    Rejected,
+}
+
+/// True when `source` must stay on the Rust interpreter.
+///
+/// The numeric VM does not see the DOM, `fetch()`, or storage. A script that
+/// names any of those stays here even if the compiler would accept the rest.
+fn script_stays_on_rust(source: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "document",
+        "getElementById",
+        "querySelector",
+        "querySelectorAll",
+        "textContent",
+        "innerHTML",
+        "innerText",
+        "localStorage",
+        "sessionStorage",
+        "fetch",
+        "addEventListener",
+        "window",
+    ];
+    let mut ident = String::new();
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            ident.push(ch);
+        } else if blocked_ident(&ident, BLOCKED) {
+            return true;
+        } else {
+            ident.clear();
+        }
+    }
+    blocked_ident(&ident, BLOCKED)
+}
+
+fn blocked_ident(ident: &str, blocked: &[&str]) -> bool {
+    if ident.is_empty() {
+        return false;
+    }
+    let found = blocked.iter().any(|word| *word == ident);
+    found
+}
+
+fn fetch_result_value(url: &str, status: u16, body: String) -> Value {
+    let mut obj = JsonValue::empty_object();
+    obj.insert("url", JsonValue::String(url.to_string()));
+    obj.insert("status", JsonValue::Number(status as f64));
+    obj.insert("ok", JsonValue::Bool((200..300).contains(&status)));
+    obj.insert("body", JsonValue::String(body));
+    Value::Json(obj)
+}
+
+/// Turn a same-origin reference into an absolute URL for the host.
+///
+/// A target that already contains `://` is returned unchanged. A path is joined
+/// to the page origin. Without an origin tuple, the target is returned as written.
+fn resolve_script_fetch_url(page: &str, target: &str) -> String {
+    let target = target.trim();
+    if target.contains("://") {
+        return target.to_string();
+    }
+    let Some((scheme, host, port)) = extract_origin_tuple(page) else {
+        return target.to_string();
+    };
+    let origin = format!("{scheme}://{host}:{port}");
+    if target.starts_with('/') {
+        return format!("{origin}{target}");
+    }
+    let after_scheme = page.split_once("://").map(|(_, rest)| rest).unwrap_or(page);
+    let path = after_scheme.split(['?', '#']).next().unwrap_or("/");
+    let path = path.find('/').map(|index| &path[index..]).unwrap_or("/");
+    let directory = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    format!("{origin}{directory}/{target}")
 }
 
 fn is_allowed_script_fetch(page_origin: Option<&str>, target_url: &str) -> bool {
@@ -2927,6 +3351,42 @@ mod tests {
     }
 
     #[test]
+    fn registered_fetch_wins_and_cross_origin_does_not_call_the_host() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut runtime = ScriptRuntime::new();
+        runtime.set_page_origin("https://app.example/index.html");
+        runtime.set_fetch_host(Arc::new(move |url, _page| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            ScriptFetchReply {
+                status: 200,
+                body: format!("host:{url}"),
+            }
+        }));
+        runtime.register_fetch_response("https://app.example/api", 201, "from-mock");
+        let mut doc = parse_html(
+            "<p id=\"out\"></p>
+             <script>
+               let mocked = fetch('https://app.example/api');
+               let denied = fetch('https://other.example/secret');
+               let live = fetch('https://app.example/live');
+               document.getElementById('out').textContent =
+                 mocked.status + ':' + mocked.body + ':' + denied.status + ':' + live.body;
+             </script>",
+        );
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(
+            doc.text_content(out),
+            "201:from-mock:403:host:https://app.example/live"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn executes_modern_js_features_and_jit_toggle() {
         let script_html = "<div id=\"root\"><span class=\"chip\">A</span><span class=\"chip\">B</span></div>
              <p id=\"result\"></p>
@@ -3035,5 +3495,61 @@ mod tests {
         // Verify origin isolation when switching page_origin.
         rt.set_page_origin("https://other.example/");
         assert_eq!(rt.local_storage_get("theme"), None);
+    }
+
+    #[test]
+    fn storage_write_past_the_origin_byte_cap_keeps_the_old_value() {
+        let mut runtime = ScriptRuntime::new();
+        runtime.set_page_origin("https://alpha.example/home");
+        runtime.local_storage_set("kept", "alpha");
+        let oversized = "x".repeat(MAX_STORAGE_ORIGIN_BYTES);
+        runtime.local_storage_set("kept", &oversized);
+        assert_eq!(runtime.local_storage_get("kept"), Some("alpha"));
+        runtime.local_storage_set("kept", "beta");
+        assert_eq!(runtime.local_storage_get("kept"), Some("beta"));
+        runtime.local_storage_set("nope", &oversized);
+        assert_eq!(runtime.local_storage_get("nope"), None);
+
+        let mut doc = parse_html(&format!(
+            "<p id=\"out\"></p>
+             <script>
+               sessionStorage.setItem('kept', 'short');
+               sessionStorage.setItem('kept', '{}');
+               document.getElementById('out').textContent = sessionStorage.getItem('kept');
+             </script>",
+            oversized
+        ));
+        runtime.run_document_scripts(&mut doc);
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "short");
+    }
+
+    #[test]
+    fn eval_script_uses_the_vm_for_a_numeric_script_and_rust_for_text_content() {
+        let numeric = "
+            function square(n) { return n * n; }
+            let acc = 0;
+            for (let i = 1; i <= 20; i++) {
+                let pt = { x: i, y: square(i) };
+                acc += pt.x + pt.y;
+            }
+            acc;
+        ";
+        let mut doc = parse_html("<p id=\"out\">before</p>");
+        let mut runtime = ScriptRuntime::new();
+        runtime.eval_script(&mut doc, numeric);
+        if is_cpp_jit_kernel_active() {
+            assert!(runtime.last_script_used_vm());
+            assert_eq!(runtime.last_vm_number(), Some(3080.0));
+        } else {
+            assert!(!runtime.last_script_used_vm());
+        }
+        runtime.eval_script(
+            &mut doc,
+            "let el = document.getElementById('out'); el.textContent = 'from-rust';",
+        );
+        assert!(!runtime.last_script_used_vm());
+        let out = doc.get_element_by_id("out").unwrap();
+        assert_eq!(doc.text_content(out), "from-rust");
     }
 }

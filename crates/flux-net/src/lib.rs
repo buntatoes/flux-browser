@@ -7,10 +7,11 @@
 //!
 //! `flux-browser` page loads call [`fetch`] and [`fetch_post`]. Those functions
 //! block a tracker hostname before connect, follow at most [`MAX_REDIRECTS`]
-//! redirects, and refuse an `https` to `http` downgrade. The script engine does
-//! not call this crate. Its `fetch()` uses in-memory mocks after a same-origin
-//! check. `gzip` and `deflate` bodies go through `flux-compress`. Cookie and
-//! HSTS snapshots go through `flux-json` in [`policy`].
+//! redirects, and refuse an `https` to `http` downgrade. Script `fetch()` is
+//! same-origin only. The Rust interpreter calls a host in `flux-browser`, and
+//! that host calls [`http_get_with_cookie`] with the session cookie jar. The
+//! numeric VM does not call this crate. `gzip` and `deflate` bodies go through
+//! `flux-compress`. Cookie and HSTS snapshots go through `flux-json` in [`policy`].
 //!
 //! Limits: [`MAX_RESPONSE`] raw bytes, [`MAX_DECOMPRESSED_BODY`] after inflate,
 //! [`MAX_HEADER_BYTES`], [`MAX_HEADER_COUNT`], and [`MAX_REDIRECTS`] hops.
@@ -863,7 +864,7 @@ fn build_request_with_cookie(url: &Url, cookie_header: Option<&str>) -> String {
         _ => String::new(),
     };
     format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/0.17\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/0.18\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\n{cookie_line}Connection: close\r\n\r\n"
     )
 }
 
@@ -908,7 +909,7 @@ pub fn build_post_request_with_cookie(
         _ => String::new(),
     };
     let mut head = format!(
-        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/0.17\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
+        "POST {path}{query} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: flux-browser/0.18\r\nAccept: text/html,text/css,image/webp,image/png,image/jpeg,image/gif,image/x-icon,image/bmp,*/*\r\nAccept-Encoding: gzip, deflate, identity\r\nReferrer-Policy: no-referrer\r\nDNT: 1\r\nX-Content-Type-Options: nosniff\r\nContent-Type: {safe_ct}\r\nContent-Length: {}\r\n{cookie_line}Connection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();

@@ -1122,15 +1122,20 @@ struct FluxCompiler {
     }
 };
 
-// BSS-allocated compiler workspace to avoid large stack frames in freestanding builds.
-FluxCompiler g_compiler{};
+extern "C" u32 flux_cpp_vm_compiler_bytes() {
+    return static_cast<u32>(sizeof(FluxCompiler));
+}
 
-} // namespace
+extern "C" u32 flux_cpp_vm_compiler_align() {
+    return static_cast<u32>(alignof(FluxCompiler));
+}
 
-bool compile_js_to_bytecode(FluxVmContext& ctx, const char* src, u32 len) noexcept {
-    if (!src) {
+bool compile_owned(FluxVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
+    if (!src || !compiler_memory) {
         return false;
     }
+    // The caller owns this workspace. It is not a process-global compiler.
+    auto& g_compiler = *static_cast<FluxCompiler*>(compiler_memory);
     g_compiler.ctx = &ctx;
     g_compiler.src = src;
     g_compiler.cursor = 0u;
@@ -1150,6 +1155,12 @@ bool compile_js_to_bytecode(FluxVmContext& ctx, const char* src, u32 len) noexce
     }
     ctx.program.emit(FluxInstruction::make_abc(FluxOpcode::Halt, last_reg, 0u, 0u));
     return !g_compiler.had_error && ctx.program.compile_ok;
+}
+
+} // namespace
+
+bool compile_js_to_bytecode(FluxVmContext& ctx, void* compiler_memory, const char* src, u32 len) noexcept {
+    return compile_owned(ctx, compiler_memory, src, len);
 }
 
 } // namespace flux_vm

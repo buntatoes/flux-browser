@@ -684,6 +684,57 @@ impl Document {
         self.set_text_content(title_id, title);
     }
 
+    /// Serialize the live tree as HTML, starting at the `html` element.
+    ///
+    /// Detached nodes are left out. Text and attribute values are escaped.
+    /// The parser decodes those escapes, so a later `parse_html` of this
+    /// string restores the text. Comments are not stored on the tree, so they
+    /// are not written back.
+    pub fn to_html(&self) -> String {
+        let mut out = String::from("<!DOCTYPE html>");
+        self.write_html(self.html, &mut out);
+        out
+    }
+
+    /// Write `id` and its live children. The tag string is copied before the
+    /// child walk so the recursive borrow can use `self` again.
+    fn write_html(&self, id: NodeId, out: &mut String) {
+        match self.get(id).data() {
+            NodeData::Text(text) => push_escaped(out, text, false),
+            NodeData::Document => {
+                let kids: Vec<NodeId> = self.children(id).to_vec();
+                for child in kids {
+                    self.write_html(child, out);
+                }
+            }
+            NodeData::Element { tag, attrs } => {
+                let tag = tag.clone();
+                let attrs = attrs.clone();
+                out.push('<');
+                out.push_str(&tag);
+                for (name, value) in &attrs {
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push_str("=\"");
+                    push_escaped(out, value, true);
+                    out.push('"');
+                }
+                let kids: Vec<NodeId> = self.children(id).to_vec();
+                if kids.is_empty() && is_void_tag(&tag) {
+                    out.push('>');
+                    return;
+                }
+                out.push('>');
+                for child in kids {
+                    self.write_html(child, out);
+                }
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+        }
+    }
+
     /// First element in tree order whose `id` attribute equals `target_id`.
     ///
     /// An empty `target_id` is `None`. The match is case-sensitive. The id is
@@ -1180,6 +1231,40 @@ pub fn urlencode_component(input: &str) -> String {
 /// empty tag (`#id` is handled first) is allowed in the split forms. Text and
 /// the document node return false. Class and id compares are case-sensitive.
 /// The tag compare ignores ASCII case.
+/// Escape `&`, `<`, and `>` in text. Attribute values also escape `"`.
+fn push_escaped(out: &mut String, text: &str, attr: bool) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if attr => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+/// Tags that have no end tag in the serializer when they have no children.
+fn is_void_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
 fn matches_simple_selector(data: &NodeData, selector: &str) -> bool {
     let Some(actual_tag) = data.tag() else {
         return false;
@@ -1229,12 +1314,31 @@ mod tests {
             .unwrap();
         assert_eq!(doc.get(paragraph).data().attr("class"), Some("note"));
         assert_eq!(doc.text_content(paragraph), "A & B");
+        let again = parse_html(&doc.to_html());
+        let again_p = again
+            .children(again.body())
+            .iter()
+            .copied()
+            .find(|id| again.get(*id).data().tag() == Some("p"))
+            .expect("paragraph");
+        assert_eq!(again.text_content(again_p), "A & B");
+        assert_eq!(again.get(again_p).data().attr("class"), Some("note"));
         let tags: Vec<_> = doc
             .children(doc.body())
             .iter()
             .filter_map(|id| doc.get(*id).data().tag())
             .collect();
         assert_eq!(tags, ["p", "br", "span"]);
+    }
+
+    #[test]
+    fn serializes_replaced_text() {
+        let mut doc = parse_html("<p id=\"out\">secret-marker</p>");
+        let id = doc.get_element_by_id("out").unwrap();
+        doc.set_text_content(id, "from-worker");
+        let again = parse_html(&doc.to_html());
+        let id2 = again.get_element_by_id("out").unwrap();
+        assert_eq!(again.text_content(id2), "from-worker");
     }
 
     #[test]

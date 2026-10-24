@@ -11,9 +11,14 @@
 //!
 //! `position: fixed` is placed against `(0, 0)` with the parent's containing
 //! width and the parent's border-box height. It is not a separate viewport.
-//! `position: absolute` uses the parent's border box. Flex items do not wrap
-//! or grow. A table row splits its content width into equal columns with a
-//! 24px floor; column widths are not shared across rows. Line breaking uses
+//! `position: absolute` uses the parent's border box. A percentage width uses
+//! the containing block width. A percentage height uses the containing block
+//! height when that height is set, and is treated as `auto` when it is not.
+//! `em` uses the element's font size. `rem` uses [`StyleMap::root_font_px`].
+//! A flex row wraps when `flex-wrap` is `wrap`. `flex-grow` shares positive
+//! free space on each of those lines and does not shrink items. Column flex
+//! does not wrap or grow. A table row splits its content width into equal
+//! columns with a 24px floor; column widths are not shared across rows. Line breaking uses
 //! [`measure`], a fixed advance of half the font size per character, not
 //! [`measure_proportional`].
 
@@ -24,8 +29,8 @@ pub use flux_dom::NodeId;
 use flux_dom::{Document, NodeData};
 pub use flux_image::Image;
 pub use flux_style::{
-    AlignItems, BoxShadow, Color, Edge, FlexDirection, JustifyContent, LinearGradient, Overflow,
-    Position,
+    AlignItems, BoxShadow, Color, Edge, FlexDirection, FlexWrap, JustifyContent, LinearGradient,
+    Overflow, Position,
 };
 use flux_style::{ComputedStyle, Display, Size, StyleMap};
 use flux_ttf::TtfFont;
@@ -155,6 +160,7 @@ pub fn layout_document_interactive(
         0.0,
         viewport_width.max(0.0),
         None,
+        None,
     )
 }
 
@@ -209,6 +215,7 @@ fn layout_node(
     x: f32,
     y: f32,
     containing_width: f32,
+    containing_height: Option<f32>,
     list_marker: Option<String>,
 ) -> LayoutBox {
     let style = *styles.get(id);
@@ -222,6 +229,7 @@ fn layout_node(
             x,
             y,
             containing_width,
+            containing_height,
         )
     } else if style.display == Display::Flex {
         layout_flex(
@@ -233,6 +241,7 @@ fn layout_node(
             x,
             y,
             containing_width,
+            containing_height,
         )
     } else {
         layout_block(
@@ -244,39 +253,61 @@ fn layout_node(
             x,
             y,
             containing_width,
+            containing_height,
             list_marker,
         )
     };
     if style.position == Position::Relative {
         // Positive top/left move down/right. Positive bottom/right move up/left.
-        let dx = match (style.left, style.right) {
-            (Size::Px(l), _) => l,
-            (Size::Auto, Size::Px(r)) => -r,
-            _ => 0.0,
+        // A percentage uses the containing block. An unresolved percentage is 0.
+        let dx = match used_length(style.left, Some(containing_width), &style, styles) {
+            Some(l) => l,
+            None => used_length(style.right, Some(containing_width), &style, styles)
+                .map(|r| -r)
+                .unwrap_or(0.0),
         };
-        let dy = match (style.top, style.bottom) {
-            (Size::Px(t), _) => t,
-            (Size::Auto, Size::Px(bt)) => -bt,
-            _ => 0.0,
+        let dy = match used_length(style.top, containing_height, &style, styles) {
+            Some(t) => t,
+            None => used_length(style.bottom, containing_height, &style, styles)
+                .map(|bt| -bt)
+                .unwrap_or(0.0),
         };
         offset_box(&mut b, dx, dy);
     }
     b
 }
 
+/// Resolve `size` against an optional containing-block `basis`.
+///
+/// `None` means `auto`, including a percentage whose basis was not passed.
+/// `em` uses the element's font size. `rem` uses the root font size.
+fn used_length(
+    size: Size,
+    basis: Option<f32>,
+    style: &ComputedStyle,
+    styles: &StyleMap,
+) -> Option<f32> {
+    match size {
+        Size::Auto => None,
+        Size::Percent(_) => size.used_px(basis?, style.font_size, styles.root_font_px()),
+        other => other.used_px(0.0, style.font_size, styles.root_font_px()),
+    }
+}
+
 /// Border-box width from `width` and `max-width`.
 ///
-/// A pixel `width` is the content width; padding and border are added. `auto`
-/// fills the containing block minus horizontal margins. A pixel `max-width`
-/// caps the border box. The result is never negative.
-fn resolve_border_width(style: &ComputedStyle, containing_width: f32) -> f32 {
+/// A definite `width` is the content width; padding and border are added.
+/// `auto`, and a percentage with no basis, fills the containing block minus
+/// horizontal margins. A definite `max-width` caps the border box. The result
+/// is never negative.
+fn resolve_border_width(style: &ComputedStyle, containing_width: f32, styles: &StyleMap) -> f32 {
     let padding_h = style.padding.left + style.padding.right;
     let border_h = style.border.left + style.border.right;
-    let mut border_width = match style.width {
-        Size::Px(width) => (width + padding_h + border_h).max(0.0),
-        Size::Auto => (containing_width - style.margin.left - style.margin.right).max(0.0),
+    let mut border_width = match used_length(style.width, Some(containing_width), style, styles) {
+        Some(width) => (width + padding_h + border_h).max(0.0),
+        None => (containing_width - style.margin.left - style.margin.right).max(0.0),
     };
-    if let Size::Px(max_w) = style.max_width {
+    if let Some(max_w) = used_length(style.max_width, Some(containing_width), style, styles) {
         let max_border_w = (max_w + padding_h + border_h).max(0.0);
         border_width = border_width.min(max_border_w);
     }
@@ -299,14 +330,16 @@ fn layout_block(
     x: f32,
     y: f32,
     containing_width: f32,
+    containing_height: Option<f32>,
     list_marker: Option<String>,
 ) -> LayoutBox {
     let style = *styles.get(id);
     let padding = style.padding;
     let margin = style.margin;
     let border = style.border;
+    let child_cb_height = used_length(style.height, containing_height, &style, styles);
 
-    let mut border_width = resolve_border_width(&style, containing_width);
+    let mut border_width = resolve_border_width(&style, containing_width, styles);
     let data = doc.get(id).data();
     let tag = data.tag().unwrap_or("");
     let is_img = tag == "img" || tag == "video";
@@ -542,6 +575,7 @@ fn layout_block(
                     content_x,
                     cursor_y,
                     content_width,
+                    child_cb_height,
                     child_marker,
                 );
                 cursor_y +=
@@ -565,16 +599,16 @@ fn layout_block(
     }
 
     let flow_height = cursor_y - (border_y + border.top + padding.top);
-    let content_height = match style.height {
-        Size::Px(height) => height.max(flow_height),
-        Size::Auto if is_img => data
+    let content_height = match used_length(style.height, containing_height, &style, styles) {
+        Some(height) => height.max(flow_height),
+        None if is_img => data
             .attr("height")
             .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
             .or_else(|| decoded_image.as_ref().map(|img| img.height as f32))
             .unwrap_or(36.0)
             .max(flow_height),
-        Size::Auto if is_checkbox => 18.0,
-        Size::Auto if is_textarea => {
+        None if is_checkbox => 18.0,
+        None if is_textarea => {
             let rows = data
                 .attr("rows")
                 .and_then(|v| v.parse::<f32>().ok())
@@ -582,8 +616,8 @@ fn layout_block(
                 .clamp(1.0, 24.0);
             flow_height.max(line_height(style.font_size) * rows)
         }
-        Size::Auto if is_text_ctrl || is_select => flow_height.max(line_height(style.font_size)),
-        Size::Auto => flow_height,
+        None if is_text_ctrl || is_select => flow_height.max(line_height(style.font_size)),
+        None => flow_height,
     };
     let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
     let parent_rect = Rect {
@@ -674,17 +708,22 @@ fn layout_out_of_flow(
         0.0,
         0.0,
         ref_rect.width,
+        Some(ref_rect.height),
         None,
     );
-    let target_x = match (style.left, style.right) {
-        (Size::Px(l), _) => ref_rect.x + l,
-        (Size::Auto, Size::Px(r)) => ref_rect.x + ref_rect.width - b.rect.width - r,
-        _ => ref_rect.x,
+    let target_x = match used_length(style.left, Some(ref_rect.width), &style, styles) {
+        Some(l) => ref_rect.x + l,
+        None => match used_length(style.right, Some(ref_rect.width), &style, styles) {
+            Some(r) => ref_rect.x + ref_rect.width - b.rect.width - r,
+            None => ref_rect.x,
+        },
     };
-    let target_y = match (style.top, style.bottom) {
-        (Size::Px(t), _) => ref_rect.y + t,
-        (Size::Auto, Size::Px(bt)) => ref_rect.y + ref_rect.height - b.rect.height - bt,
-        _ => ref_rect.y,
+    let target_y = match used_length(style.top, Some(ref_rect.height), &style, styles) {
+        Some(t) => ref_rect.y + t,
+        None => match used_length(style.bottom, Some(ref_rect.height), &style, styles) {
+            Some(bt) => ref_rect.y + ref_rect.height - b.rect.height - bt,
+            None => ref_rect.y,
+        },
     };
     let dx = target_x - b.rect.x;
     let dy = target_y - b.rect.y;
@@ -709,12 +748,13 @@ fn layout_table_row(
     x: f32,
     y: f32,
     containing_width: f32,
+    containing_height: Option<f32>,
 ) -> LayoutBox {
     let style = *styles.get(id);
     let padding = style.padding;
     let margin = style.margin;
     let border = style.border;
-    let border_width = resolve_border_width(&style, containing_width);
+    let border_width = resolve_border_width(&style, containing_width, styles);
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
     let border_x = x + margin.left;
@@ -746,6 +786,7 @@ fn layout_table_row(
             cursor_x,
             content_y,
             col_width,
+            containing_height,
             None,
         );
         row_height = row_height.max(cell_box.rect.height);
@@ -757,9 +798,9 @@ fn layout_table_row(
         cell.rect.height = row_height;
     }
 
-    let content_height = match style.height {
-        Size::Px(h) => h.max(row_height),
-        Size::Auto => row_height,
+    let content_height = match used_length(style.height, containing_height, &style, styles) {
+        Some(h) => h.max(row_height),
+        None => row_height,
     };
     let border_height = content_height + padding.top + padding.bottom + border.top + border.bottom;
 
@@ -786,14 +827,24 @@ fn layout_table_row(
     }
 }
 
+/// One flex item after its base border box has been measured.
+struct FlexItem {
+    node_box: LayoutBox,
+    outer_w: f32,
+    outer_h: f32,
+    grow: f32,
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Flex layout. Items do not wrap and do not grow.
+/// Flex layout.
 ///
 /// A column stacks children downward with `gap` between them and ignores
-/// `justify-content` and `align-items`. A row measures each item once, then
-/// packs that single line. Free space is never negative. `space-between` with
-/// one item matches start. `align-items: stretch` only increases the border-box
-/// height of an item whose height is `auto`.
+/// `justify-content`, `align-items`, `flex-wrap`, and `flex-grow`. A row
+/// measures each item once. `flex-wrap: wrap` starts a new line when the next
+/// item does not fit. `flex-grow` then shares positive free space on each line
+/// and does not shrink an overflowing line. `space-between` with one item
+/// matches start. `align-items: stretch` only increases the border-box height
+/// of an item whose height is `auto`.
 fn layout_flex(
     doc: &Document,
     styles: &StyleMap,
@@ -803,18 +854,20 @@ fn layout_flex(
     x: f32,
     y: f32,
     containing_width: f32,
+    containing_height: Option<f32>,
 ) -> LayoutBox {
     let style = *styles.get(id);
     let padding = style.padding;
     let margin = style.margin;
     let border = style.border;
-    let border_width = resolve_border_width(&style, containing_width);
+    let border_width = resolve_border_width(&style, containing_width, styles);
     let content_width =
         (border_width - padding.left - padding.right - border.left - border.right).max(0.0);
     let border_x = x + margin.left;
     let border_y = y + margin.top;
     let content_x = border_x + border.left + padding.left;
     let content_y = border_y + border.top + padding.top;
+    let specified_height = used_length(style.height, containing_height, &style, styles);
 
     let visible_children: Vec<NodeId> = doc
         .children(id)
@@ -839,6 +892,7 @@ fn layout_flex(
                 content_x,
                 cursor_y,
                 content_width,
+                specified_height,
                 None,
             );
             let child_style = styles.get(child);
@@ -846,10 +900,7 @@ fn layout_flex(
             children.push(child_box);
         }
         let flow_height = (cursor_y - content_y).max(0.0);
-        let content_height = match style.height {
-            Size::Px(h) => h.max(flow_height),
-            Size::Auto => flow_height,
-        };
+        let content_height = specified_height.unwrap_or(0.0).max(flow_height);
         return LayoutBox {
             node: id,
             rect: Rect {
@@ -873,50 +924,50 @@ fn layout_flex(
         };
     }
 
-    // One horizontal flex line. Items are not wrapped when they overflow.
-    let mut children = Vec::new();
-    let mut total_item_width = 0.0_f32;
-    let mut max_item_height = 0.0_f32;
-
+    let mut items = Vec::new();
     for child in &visible_children {
         let child_style = styles.get(*child);
-        let basis_width = match child_style.width {
-            Size::Px(w) => {
-                w + child_style.padding.left
-                    + child_style.padding.right
-                    + child_style.border.left
-                    + child_style.border.right
-                    + child_style.margin.left
-                    + child_style.margin.right
-            }
-            Size::Auto => {
-                let child_data = doc.get(*child).data();
-                let child_tag = child_data.tag().unwrap_or("");
-                let intrinsic_content_w = if child_tag == "img" || child_tag == "video" {
-                    child_data
-                        .attr("width")
-                        .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
-                        .or_else(|| images.get(child).map(|img| img.width as f32))
-                        .unwrap_or(120.0)
-                } else if child_tag == "input" && doc.is_text_input(*child) {
-                    (content_width - 136.0).clamp(160.0, 560.0)
-                } else if child_tag == "input" && doc.is_submit_control(*child) {
-                    let lbl = child_data.attr("value").unwrap_or("Submit");
-                    measure(lbl, child_style.font_size) + 12.0
-                } else if child_tag == "button" {
-                    measure(&doc.text_content(*child), child_style.font_size) + 12.0
-                } else {
-                    measure(&doc.text_content(*child), child_style.font_size)
-                };
-                (intrinsic_content_w
-                    + child_style.padding.left
-                    + child_style.padding.right
-                    + child_style.border.left
-                    + child_style.border.right
-                    + child_style.margin.left
-                    + child_style.margin.right)
-                    .min(content_width)
-            }
+        let resolved_content_w =
+            used_length(child_style.width, Some(content_width), child_style, styles);
+        let basis_width = if let Some(w) = resolved_content_w {
+            w + child_style.padding.left
+                + child_style.padding.right
+                + child_style.border.left
+                + child_style.border.right
+                + child_style.margin.left
+                + child_style.margin.right
+        } else {
+            let child_data = doc.get(*child).data();
+            let child_tag = child_data.tag().unwrap_or("");
+            let intrinsic_content_w = if child_tag == "img" || child_tag == "video" {
+                child_data
+                    .attr("width")
+                    .and_then(|v| v.trim_end_matches("px").parse::<f32>().ok())
+                    .or_else(|| images.get(child).map(|img| img.width as f32))
+                    .unwrap_or(120.0)
+            } else if child_tag == "input" && doc.is_text_input(*child) {
+                (content_width - 136.0).clamp(160.0, 560.0)
+            } else if child_tag == "input" && doc.is_submit_control(*child) {
+                let lbl = child_data.attr("value").unwrap_or("Submit");
+                measure(lbl, child_style.font_size) + 12.0
+            } else if child_tag == "button" {
+                measure(&doc.text_content(*child), child_style.font_size) + 12.0
+            } else {
+                measure(&doc.text_content(*child), child_style.font_size)
+            };
+            (intrinsic_content_w
+                + child_style.padding.left
+                + child_style.padding.right
+                + child_style.border.left
+                + child_style.border.right
+                + child_style.margin.left
+                + child_style.margin.right)
+                .min(content_width)
+        };
+        let item_containing = if resolved_content_w.is_some() {
+            content_width
+        } else {
+            basis_width
         };
         let child_box = layout_node(
             doc,
@@ -926,65 +977,115 @@ fn layout_flex(
             *child,
             0.0,
             0.0,
-            basis_width,
+            item_containing,
+            specified_height,
             None,
         );
         let outer_w = child_style.margin.left + child_box.rect.width + child_style.margin.right;
         let outer_h = child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
-        total_item_width += outer_w;
-        max_item_height = max_item_height.max(outer_h);
-        children.push(child_box);
+        items.push(FlexItem {
+            node_box: child_box,
+            outer_w,
+            outer_h,
+            grow: child_style.flex_grow,
+        });
     }
 
-    let count = children.len();
-    let total_gaps = if count > 1 {
-        style.gap * ((count - 1) as f32)
-    } else {
-        0.0
-    };
-    let free_space = (content_width - total_item_width - total_gaps).max(0.0);
-    let (mut cursor_x, step_gap) = match style.justify_content {
-        JustifyContent::Start => (content_x, style.gap),
-        JustifyContent::Center => (content_x + free_space * 0.5, style.gap),
-        JustifyContent::End => (content_x + free_space, style.gap),
-        JustifyContent::SpaceBetween if count > 1 => {
-            (content_x, style.gap + free_space / ((count - 1) as f32))
+    let wrap = style.flex_wrap == FlexWrap::Wrap;
+    let mut lines: Vec<Vec<FlexItem>> = Vec::new();
+    let mut current: Vec<FlexItem> = Vec::new();
+    let mut line_width = 0.0_f32;
+    for item in items {
+        let gap = if current.is_empty() { 0.0 } else { style.gap };
+        if wrap && !current.is_empty() && line_width + gap + item.outer_w > content_width {
+            lines.push(std::mem::take(&mut current));
+            line_width = 0.0;
         }
-        JustifyContent::SpaceBetween => (content_x, style.gap),
-    };
+        let gap = if current.is_empty() { 0.0 } else { style.gap };
+        line_width += gap + item.outer_w;
+        current.push(item);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
 
-    let row_height = match style.height {
-        Size::Px(h) => h.max(max_item_height),
-        Size::Auto => max_item_height,
-    };
-
-    for child_box in &mut children {
-        let child_style = styles.get(child_box.node);
-        let outer_h = child_style.margin.top + child_box.rect.height + child_style.margin.bottom;
-        let y_offset = match style.align_items {
-            AlignItems::Start | AlignItems::Stretch => 0.0,
-            AlignItems::Center => ((row_height - outer_h) * 0.5).max(0.0),
-            AlignItems::End => (row_height - outer_h).max(0.0),
+    let mut children = Vec::new();
+    let mut cursor_y = content_y;
+    let mut lines_cross = 0.0_f32;
+    for (line_index, line) in lines.iter_mut().enumerate() {
+        if line_index > 0 {
+            cursor_y += style.gap;
+            lines_cross += style.gap;
+        }
+        let count = line.len();
+        let gaps = if count > 1 {
+            style.gap * ((count - 1) as f32)
+        } else {
+            0.0
         };
-        let dx = (cursor_x + child_style.margin.left) - child_box.rect.x;
-        let dy = (content_y + y_offset + child_style.margin.top) - child_box.rect.y;
-        offset_box(child_box, dx, dy);
-        if style.align_items == AlignItems::Stretch && matches!(child_style.height, Size::Auto) {
-            child_box.rect.height =
-                (row_height - child_style.margin.top - child_style.margin.bottom)
-                    .max(child_box.rect.height);
+        let used: f32 = line.iter().map(|item| item.outer_w).sum();
+        let free_space = (content_width - used - gaps).max(0.0);
+        let grow_sum: f32 = line.iter().map(|item| item.grow).sum();
+        if free_space > 0.0 && grow_sum > 0.0 {
+            for item in line.iter_mut() {
+                if item.grow > 0.0 {
+                    let extra = free_space * item.grow / grow_sum;
+                    item.node_box.rect.width += extra;
+                    item.outer_w += extra;
+                }
+            }
         }
-        cursor_x +=
-            child_style.margin.left + child_box.rect.width + child_style.margin.right + step_gap;
+        let used_after: f32 = line.iter().map(|item| item.outer_w).sum();
+        let free_after = (content_width - used_after - gaps).max(0.0);
+        let (mut cursor_x, step_gap) = match style.justify_content {
+            JustifyContent::Start => (content_x, style.gap),
+            JustifyContent::Center => (content_x + free_after * 0.5, style.gap),
+            JustifyContent::End => (content_x + free_after, style.gap),
+            JustifyContent::SpaceBetween if count > 1 => {
+                (content_x, style.gap + free_after / ((count - 1) as f32))
+            }
+            JustifyContent::SpaceBetween => (content_x, style.gap),
+        };
+        let line_height = line.iter().map(|item| item.outer_h).fold(0.0_f32, f32::max);
+        for item in line.iter_mut() {
+            let child_style = styles.get(item.node_box.node);
+            let y_offset = match style.align_items {
+                AlignItems::Start | AlignItems::Stretch => 0.0,
+                AlignItems::Center => ((line_height - item.outer_h) * 0.5).max(0.0),
+                AlignItems::End => (line_height - item.outer_h).max(0.0),
+            };
+            let dx = (cursor_x + child_style.margin.left) - item.node_box.rect.x;
+            let dy = (cursor_y + y_offset + child_style.margin.top) - item.node_box.rect.y;
+            offset_box(&mut item.node_box, dx, dy);
+            if style.align_items == AlignItems::Stretch && matches!(child_style.height, Size::Auto)
+            {
+                item.node_box.rect.height =
+                    (line_height - child_style.margin.top - child_style.margin.bottom)
+                        .max(item.node_box.rect.height);
+            }
+            cursor_x += child_style.margin.left
+                + item.node_box.rect.width
+                + child_style.margin.right
+                + step_gap;
+        }
+        lines_cross += line_height;
+        cursor_y += line_height;
+        for item in line.drain(..) {
+            children.push(item.node_box);
+        }
     }
 
+    let content_height = specified_height.unwrap_or(0.0).max(lines_cross);
     LayoutBox {
         node: id,
         rect: Rect {
             x: border_x,
             y: border_y,
             width: border_width,
-            height: row_height + padding.top + padding.bottom + border.top + border.bottom,
+            height: content_height + padding.top + padding.bottom + border.top + border.bottom,
         },
         position: style.position,
         z_index: style.z_index,
@@ -1508,5 +1609,55 @@ mod tests {
         collect_tag(&doc, &tree, "select", &mut selects);
         assert_eq!(selects.len(), 1);
         assert!(selects[0].text[0].text.contains("Dark Mode"));
+    }
+
+    #[test]
+    fn resolves_percent_em_rem_and_wraps_a_flex_row_that_grows() {
+        let (doc, tree) = render(
+            "<style>
+                html, body, div { margin: 0; padding: 0; }
+                html { font-size: 20px; }
+                #host { width: 200px; height: 100px; background: #111111; }
+                #pct { width: 50%; height: 40%; background: #ff0000; }
+                #em { font-size: 1.5rem; width: 2em; height: 10px; background: #00ff00; }
+                #row { display: flex; flex-wrap: wrap; width: 100px; background: #0000ff; }
+                #row div { width: 40px; height: 10px; }
+                #grow { display: flex; width: 100px; height: 10px; }
+                #g1 { width: 20px; height: 10px; flex-grow: 1; background: #abcdef; }
+                #g2 { width: 20px; height: 10px; flex-grow: 2; background: #fedcba; }
+             </style>
+             <div id=\"host\"><div id=\"pct\"></div><div id=\"em\"></div></div>
+             <div id=\"row\"><div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div></div>
+             <div id=\"grow\"><div id=\"g1\"></div><div id=\"g2\"></div></div>",
+            200.0,
+        );
+        let rect = |id: &str| {
+            fn find<'a>(doc: &Document, tree: &'a LayoutBox, id: &str) -> Option<&'a LayoutBox> {
+                if doc.get(tree.node).data().attr("id") == Some(id) {
+                    return Some(tree);
+                }
+                for child in &tree.children {
+                    if let Some(found) = find(doc, child, id) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            find(&doc, &tree, id).unwrap().rect
+        };
+        assert_eq!(rect("pct").width, 100.0);
+        assert_eq!(rect("pct").height, 40.0);
+        assert_eq!(rect("pct").x, 0.0);
+        assert_eq!(rect("pct").y, 0.0);
+        assert_eq!(rect("em").width, 60.0);
+        assert_eq!(rect("em").height, 10.0);
+        assert_eq!(rect("em").y, 40.0);
+        assert_eq!(rect("a").x, 0.0);
+        assert_eq!(rect("b").x, 40.0);
+        assert_eq!(rect("c").x, 0.0);
+        assert_eq!(rect("c").y, rect("a").y + 10.0);
+        assert_eq!(rect("g1").width, 40.0);
+        assert_eq!(rect("g2").width, 60.0);
+        assert_eq!(rect("g2").x, rect("g1").x + 40.0);
     }
 }

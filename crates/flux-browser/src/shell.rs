@@ -1,9 +1,10 @@
 //! Window and input loop.
 //!
 //! Windows uses Win32. Linux uses X11. Both rasterize through compose_frame
-//! into a CPU framebuffer. Windows copies that buffer with SetDIBitsToDevice
-//! on WM_PAINT. Linux copies it with XPutImage on Expose. Neither path
-//! creates a swapchain or presents a GPU texture.
+//! into a CPU framebuffer. Windows presents that buffer with Direct3D 11 when
+//! the device and `compositor.hlsl` compile succeed, and otherwise copies it
+//! with SetDIBitsToDevice. Linux copies it with XPutImage. The page is still
+//! rasterized on the CPU. Video frames are still decoded on the CPU.
 //!
 //! Zoom steps are Session::zoom_in, zoom_out, and reset_zoom in lib.rs.
 //! This file only requests them. The settings button opens flux://settings.
@@ -21,7 +22,10 @@ use crate::ui::{
     AppMenuAction, ContextMenuAction, TOP_BAR_HEIGHT, UiHit, UiState, compose_frame,
     content_viewport, hit_test_ui_with_state_and_height,
 };
-use crate::{ClickOutcome, Page, Session, Viewport, load_post_target, load_target};
+use crate::{
+    ClickOutcome, Page, Session, Viewport, load_post_for_navigation, load_target_for_navigation,
+    navigation_error_page,
+};
 
 /// Tab index plus a finished page or error, shared with the load thread.
 type PendingLoad = Arc<Mutex<Option<(usize, Result<Page, String>)>>>;
@@ -43,6 +47,9 @@ struct Host {
     window_height: u32,
     framebuffer: Framebuffer,
     pending_load: PendingLoad,
+    /// Direct3D present for the CPU buffer. Absent on Linux.
+    #[cfg(windows)]
+    present: crate::present::PresentPath,
 }
 
 impl Host {
@@ -117,8 +124,8 @@ impl Host {
     }
 }
 
-// Windows message loop. Pixels reach the window through SetDIBitsToDevice.
-// There is no GPU swapchain on this path.
+// Windows message loop. The CPU framebuffer is presented with Direct3D 11
+// when that device is available. SetDIBitsToDevice is the fallback.
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
@@ -129,8 +136,8 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_target,
-        load_target,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
+        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
     };
 
     /// Win32 window handle. Stored as a pointer-sized value without a windows crate.
@@ -634,11 +641,22 @@ mod imp {
                 }
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();
+                let fetch_jar = self.session.cookie_jar_handle();
+                let scripts_enabled = self.session.settings().scripts_enabled;
+                let tab_id = tab_index as u64;
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = super::catch_load(|| load_target(&target_url, viewport));
+                    let result = super::catch_load(|| {
+                        load_target_for_navigation(
+                            &target_url,
+                            viewport,
+                            Some(fetch_jar),
+                            scripts_enabled,
+                            tab_id,
+                        )
+                    });
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -670,11 +688,23 @@ mod imp {
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();
+                let fetch_jar = self.session.cookie_jar_handle();
+                let scripts_enabled = self.session.settings().scripts_enabled;
+                let tab_id = tab_index as u64;
                 let slot = Arc::clone(&self.pending_load);
                 let hwnd_addr = hwnd as usize;
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = super::catch_load(|| load_post_target(&url, &payload, viewport));
+                    let result = super::catch_load(|| {
+                        load_post_for_navigation(
+                            &url,
+                            &payload,
+                            viewport,
+                            Some(fetch_jar),
+                            scripts_enabled,
+                            tab_id,
+                        )
+                    });
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -709,6 +739,7 @@ mod imp {
             window_height: win_h,
             framebuffer,
             pending_load: Arc::new(Mutex::new(None)),
+            present: crate::present::PresentPath::Untried,
         });
 
         let class_name = wide("FluxWindow");
@@ -844,7 +875,15 @@ mod imp {
                         .ok()
                         .and_then(|mut guard| guard.take());
                     host.ui.set_loading(false);
-                    if let Some((tab_idx, Ok(page))) = finished {
+                    if let Some((tab_idx, result)) = finished {
+                        let page = match result {
+                            Ok(page) => page,
+                            Err(message) => navigation_error_page(
+                                "flux://navigation-error",
+                                &message,
+                                host.session.viewport(),
+                            ),
+                        };
                         host.session.open_page_in_tab(tab_idx, page);
                     }
                     refresh_window(hwnd, host);
@@ -1604,8 +1643,8 @@ mod imp {
                 }
                 0
             }
-            // Present. Convert the framebuffer to bottom-up BGRA and SetDIBitsToDevice.
-            // No GPU texture is involved.
+            // Present the CPU framebuffer. Direct3D 11 uploads it when the
+            // device is available. Otherwise SetDIBitsToDevice copies it.
             WM_PAINT => {
                 let mut ps = PaintStruct {
                     hdc: null_mut(),
@@ -1619,38 +1658,43 @@ mod imp {
                 if let Some(host) = unsafe { host_mut(hwnd) } {
                     let width = host.framebuffer.width();
                     let height = host.framebuffer.height();
-                    let bgra = host.framebuffer.to_bgra_bottom_up();
-                    let info = BitmapInfo {
-                        bmi_header: BitmapInfoHeader {
-                            bi_size: size_of::<BitmapInfoHeader>() as u32,
-                            bi_width: width as i32,
-                            bi_height: height as i32,
-                            bi_planes: 1,
-                            bi_bit_count: 32,
-                            bi_compression: BI_RGB,
-                            bi_size_image: 0,
-                            bi_x_pels_per_meter: 0,
-                            bi_y_pels_per_meter: 0,
-                            bi_clr_used: 0,
-                            bi_clr_important: 0,
-                        },
-                        bmi_colors: [0],
-                    };
-                    unsafe {
-                        SetDIBitsToDevice(
-                            hdc,
-                            0,
-                            0,
-                            width,
-                            height,
-                            0,
-                            0,
-                            0,
-                            height,
-                            bgra.as_ptr().cast::<c_void>(),
-                            &info,
-                            DIB_RGB_COLORS,
-                        );
+                    let presented =
+                        host.present
+                            .paint(hwnd, host.framebuffer.pixels(), width, height);
+                    if !presented {
+                        let bgra = host.framebuffer.to_bgra_bottom_up();
+                        let info = BitmapInfo {
+                            bmi_header: BitmapInfoHeader {
+                                bi_size: size_of::<BitmapInfoHeader>() as u32,
+                                bi_width: width as i32,
+                                bi_height: height as i32,
+                                bi_planes: 1,
+                                bi_bit_count: 32,
+                                bi_compression: BI_RGB,
+                                bi_size_image: 0,
+                                bi_x_pels_per_meter: 0,
+                                bi_y_pels_per_meter: 0,
+                                bi_clr_used: 0,
+                                bi_clr_important: 0,
+                            },
+                            bmi_colors: [0],
+                        };
+                        unsafe {
+                            SetDIBitsToDevice(
+                                hdc,
+                                0,
+                                0,
+                                width,
+                                height,
+                                0,
+                                0,
+                                0,
+                                height,
+                                bgra.as_ptr().cast::<c_void>(),
+                                &info,
+                                DIB_RGB_COLORS,
+                            );
+                        }
                     }
                 }
                 unsafe {
@@ -1721,8 +1765,8 @@ mod imp {
     use super::{
         AppMenuAction, ClickOutcome, ContextMenuAction, DOWNLOADS_URL, HISTORY_URL, HOME_URL, Host,
         INSPECT_URL, SECURITY_URL, SETTINGS_URL, Session, TOP_BAR_HEIGHT, UiHit, UiState, Viewport,
-        compose_frame, content_viewport, hit_test_ui_with_state_and_height, load_post_target,
-        load_target,
+        compose_frame, content_viewport, hit_test_ui_with_state_and_height,
+        load_post_for_navigation, load_target_for_navigation, navigation_error_page,
     };
 
     /// Opaque X11 Display. Opened with XOpenDisplay and closed at the end of the loop.
@@ -2038,10 +2082,21 @@ mod imp {
                     };
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();
+                let fetch_jar = self.session.cookie_jar_handle();
+                let scripts_enabled = self.session.settings().scripts_enabled;
+                let tab_id = tab_index as u64;
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = super::catch_load(|| load_target(&url, viewport));
+                    let result = super::catch_load(|| {
+                        load_target_for_navigation(
+                            &url,
+                            viewport,
+                            Some(fetch_jar),
+                            scripts_enabled,
+                            tab_id,
+                        )
+                    });
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -2060,10 +2115,22 @@ mod imp {
                 let payload = body.to_string();
                 let viewport = self.session.viewport();
                 let tab_index = self.session.active_index();
+                let fetch_jar = self.session.cookie_jar_handle();
+                let scripts_enabled = self.session.settings().scripts_enabled;
+                let tab_id = tab_index as u64;
                 let slot = Arc::clone(&self.pending_load);
                 self.ui.set_loading(true);
                 thread::spawn(move || {
-                    let result = super::catch_load(|| load_post_target(&url, &payload, viewport));
+                    let result = super::catch_load(|| {
+                        load_post_for_navigation(
+                            &url,
+                            &payload,
+                            viewport,
+                            Some(fetch_jar),
+                            scripts_enabled,
+                            tab_id,
+                        )
+                    });
                     if let Ok(mut guard) = slot.lock() {
                         *guard = Some((tab_index, result));
                     }
@@ -2128,9 +2195,15 @@ mod imp {
                     host.pending_load.lock().ok().and_then(|mut g| g.take())
                 {
                     host.ui.set_loading(false);
-                    if let Ok(page) = res {
-                        host.session.open_page_in_tab(tab_idx, page);
-                    }
+                    let page = match res {
+                        Ok(page) => page,
+                        Err(message) => navigation_error_page(
+                            "flux://navigation-error",
+                            &message,
+                            host.session.viewport(),
+                        ),
+                    };
+                    host.session.open_page_in_tab(tab_idx, page);
                     host.redraw();
                     set_x11_title(display, window, &host.window_title());
                     present_x11(display, screen, window, &host);

@@ -32,7 +32,8 @@ fn find_msvc_tool(tool_name: &str) -> Option<PathBuf> {
 }
 
 fn walk_for_host_x64_tool(dir: &Path, tool_name: &str, depth: usize) -> Option<PathBuf> {
-    if depth > 8 {
+    // Hostx64\x64 sits deeper than eight directories under the Visual Studio root.
+    if depth > 12 {
         return None;
     }
     let entries = fs::read_dir(dir).ok()?;

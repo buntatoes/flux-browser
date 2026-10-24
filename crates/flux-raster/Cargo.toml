@@ -13,3 +13,7 @@ flux-style = { path = "../flux-style" }
 flux-gpu.workspace = true
 flux-image.workspace = true
 flux-ttf.workspace = true
+
+[dev-dependencies]
+flux-dom = { path = "../flux-dom" }
+flux-layout = { path = "../flux-layout" }

@@ -1,4 +1,4 @@
-# Desktop browser workspace. Crate version 0.17.0. Not published.
+# Desktop browser workspace. Crate version 0.18.0. Not published.
 #
 # Page pipeline, in order:
 #   flux-dom parses HTML into one node list.
@@ -10,7 +10,8 @@
 # Beside that pipeline:
 #   flux-script runs a budgeted JS runtime and C++20 FluxVM register bytecode interpreter against the document and uses flux-json.
 #   flux-net loads HTTP and HTTPS documents and uses flux-compress and flux-json.
-#   flux-sandbox applies process limits. Ordinary pages still render in-process.
+#   flux-sandbox applies process limits. An http(s) load starts one --tab-worker.
+#   flux:// pages and files still render in the window process.
 #   flux-browser owns the window, tabs, downloads, and the sealed profile file (with persisted localStorage).
 #
 # The seven libraries under [workspace.dependencies] are separate repositories
@@ -37,7 +38,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 authors = ["Buntos <324143321+buntatoes@users.noreply.github.com>"]
 description = "Small desktop browser (Proof of Concept). HTML, CSS, layout, C++20 raster compositor, and C++20 FluxVM script runtime."

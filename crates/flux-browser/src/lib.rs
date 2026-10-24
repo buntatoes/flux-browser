@@ -6,29 +6,39 @@
 //!
 //! A tab is a `Page` history stack in this process. `flux-sandbox`'s
 //! `execute_isolated` runs a closure here and catches a panic. It does not
-//! start `--tab-worker`. That flag is handled only by `main`.
+//! start `--tab-worker`. That flag is handled only by `main`. An http(s)
+//! load starts one `--tab-worker` process, waits for one frame, and paints
+//! the returned document only when that frame says `ok`. A timeout or a bad
+//! frame becomes an error page. `flux://` pages and files stay in this process.
 //!
 //! Building a page uses `flux-dom` (parse), `flux-script` (scripts),
 //! `flux-style` (CSS), `flux-layout`, and `flux-paint`. `Session::rasterize`
 //! calls `flux-raster` after that. `flux-net` fetches pages, stores cookies,
-//! and checks CSP. `flux-image` decodes images. `flux-video` decodes clips.
+//! and checks CSP. Script `fetch()` is same-origin and uses that cookie jar
+//! through a host callback. The numeric VM does not perform it.
+//! `flux-image` decodes images. `flux-video` decodes clips.
 //! `frontend` builds `flux://` HTML. `profile` reads and writes `profile.flx`.
 
 pub mod downloads;
 pub mod frontend;
 pub mod installer;
 pub mod logo;
+#[cfg(windows)]
+pub mod present;
 pub mod profile;
 #[cfg(any(windows, target_os = "linux"))]
 pub mod shell;
 pub mod ui;
+pub mod worker;
 
 /// Release name for this tree.
-pub const VERSION: &str = "v.17";
+pub const VERSION: &str = "v.18";
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 pub use downloads::{DownloadEntry, DownloadManager, DownloadState};
 use flux_dom::{Document, NodeId};
@@ -37,9 +47,9 @@ use flux_image::decode_auto;
 use flux_json::{JsonValue, parse_json, to_json_pretty};
 use flux_layout::{LayoutBox, Rect, hit_test, layout_document_interactive};
 use flux_net::{
-    ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, NetError, allows_corp_subresource,
-    append_query, fetch, fetch_post, is_url_blocked_by_default_shield, resolve_url,
-    verify_subresource_integrity,
+    ContentSecurityPolicy, CookieJar, CspDirective, HstsStore, MAX_REDIRECTS, NetError,
+    allows_corp_subresource, append_query, fetch, fetch_post, http_get_with_cookie, is_same_origin,
+    is_url_blocked_by_default_shield, parse_url, resolve_url, verify_subresource_integrity,
 };
 pub use flux_net::{NetworkShield, ShieldBlockReason, sri_sha256_token};
 use flux_paint::{DisplayItem, DisplayList, paint};
@@ -48,7 +58,7 @@ pub use flux_sandbox::{
     MandatorySandboxGuard, SandboxError, SandboxTelemetry, TabWorkerRequest, TabWorkerResponse,
     enforce_mandatory_sandbox_or_abort, lock_current_worker_process_or_abort,
 };
-use flux_script::ScriptRuntime;
+use flux_script::{ScriptFetchReply, ScriptRuntime, limit_script_fetch_body};
 use flux_style::{compute_styles_with_viewport, parse_css};
 pub use flux_video::{
     CdmSession, DEFAULT_EME_DEMO_KEY, DEFAULT_EME_DEMO_KID, EmeKeySystem, Mp4Metadata, VideoClip,
@@ -488,6 +498,9 @@ pub enum BrowserError {
     Status(u16),
     /// The response body was not UTF-8 text.
     Utf8,
+    /// The tab worker timed out, rejected the frame, or failed to start.
+    /// The document was not rendered in this process.
+    Worker(String),
 }
 
 impl std::fmt::Display for BrowserError {
@@ -497,6 +510,7 @@ impl std::fmt::Display for BrowserError {
             Self::Net(err) => write!(f, "{err}"),
             Self::Status(status) => write!(f, "the server returned {status}"),
             Self::Utf8 => write!(f, "the page was not text"),
+            Self::Worker(message) => write!(f, "{message}"),
         }
     }
 }
@@ -521,7 +535,7 @@ pub fn render_html_with_resources(
     url: &str,
     viewport: Viewport,
 ) -> Page {
-    render_html_with_resources_and_csp(html, external_css, images, url, viewport, None, 0)
+    render_html_with_resources_and_csp(html, external_css, images, url, viewport, None, 0, None)
 }
 
 /// Build a `Page` from HTML with pre-populated `local_storage`.
@@ -540,6 +554,8 @@ pub fn render_html_with_storage(
         None,
         0,
         initial_storage,
+        None,
+        true,
     )
 }
 
@@ -554,6 +570,7 @@ pub fn render_html_with_resources_and_csp(
     viewport: Viewport,
     http_csp_header: Option<&str>,
     initial_blocked_csp: usize,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
 ) -> Page {
     render_html_with_resources_csp_and_storage(
         html,
@@ -564,6 +581,8 @@ pub fn render_html_with_resources_and_csp(
         http_csp_header,
         initial_blocked_csp,
         &[],
+        fetch_jar,
+        true,
     )
 }
 
@@ -578,11 +597,15 @@ pub fn render_html_with_resources_csp_and_storage(
     http_csp_header: Option<&str>,
     initial_blocked_csp: usize,
     initial_storage: &[(String, String, String)],
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    run_scripts: bool,
 ) -> Page {
-    // Pipeline order: parse HTML (flux-dom), run allowed scripts (flux-script),
-    // attach images and video frames, parse CSS and compute style (flux-style),
-    // lay out (flux-layout), then paint (flux-paint). Session::rasterize calls
-    // flux-raster later. This function does not rasterize and does not start a worker.
+    // Pipeline order: parse HTML (flux-dom), optionally run allowed scripts
+    // (flux-script), attach images and video frames, parse CSS and compute
+    // style (flux-style), lay out (flux-layout), then paint (flux-paint).
+    // Session::rasterize calls flux-raster later. This function does not
+    // rasterize and does not start a worker. `run_scripts` is false when the
+    // HTML already came back from `--tab-worker`.
     let mut document = flux_dom::parse_html(html);
     let combined_csp_raw = match (http_csp_header, document.meta_csp()) {
         (Some(h), Some(m)) => format!("{h}; {m}"),
@@ -595,56 +618,59 @@ pub fn render_html_with_resources_csp_and_storage(
 
     let mut runtime = ScriptRuntime::new();
     runtime.set_page_origin(url);
+    bind_script_fetch(&mut runtime, fetch_jar);
     if !initial_storage.is_empty() {
         runtime.import_local_storage(initial_storage);
     }
-    for (src, integrity) in document.external_scripts_with_integrity() {
-        if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
-            blocked_csp_count += 1;
-            continue;
-        }
-        let Some(resolved) = resolve_url(url, &src) else {
-            continue;
-        };
-        if is_url_blocked_by_default_shield(&resolved, Some(url)).is_some() {
-            blocked_csp_count += 1;
-            continue;
-        }
-        let raw_bytes = if is_remote_origin(&resolved) {
-            fetch(&resolved).ok().and_then(|(_, resp)| {
-                if !allows_corp_subresource(
-                    resp.header("cross-origin-resource-policy"),
-                    url,
-                    &resolved,
-                ) {
-                    blocked_csp_count += 1;
-                    return None;
-                }
-                if (200..300).contains(&resp.status) {
-                    Some(resp.body)
-                } else {
-                    None
-                }
-            })
-        } else if !is_remote_origin(url) && !url.starts_with("flux://") {
-            fs::read(&resolved).ok()
-        } else {
-            None
-        };
-        if let Some(bytes) = raw_bytes {
-            if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+    if run_scripts {
+        for (src, integrity) in document.external_scripts_with_integrity() {
+            if !csp.allows_resource(CspDirective::ScriptSrc, url, &src) {
                 blocked_csp_count += 1;
                 continue;
             }
-            if let Ok(code) = String::from_utf8(bytes) {
-                runtime.eval_script(&mut document, &code);
+            let Some(resolved) = resolve_url(url, &src) else {
+                continue;
+            };
+            if is_url_blocked_by_default_shield(&resolved, Some(url)).is_some() {
+                blocked_csp_count += 1;
+                continue;
+            }
+            let raw_bytes = if is_remote_origin(&resolved) {
+                fetch(&resolved).ok().and_then(|(_, resp)| {
+                    if !allows_corp_subresource(
+                        resp.header("cross-origin-resource-policy"),
+                        url,
+                        &resolved,
+                    ) {
+                        blocked_csp_count += 1;
+                        return None;
+                    }
+                    if (200..300).contains(&resp.status) {
+                        Some(resp.body)
+                    } else {
+                        None
+                    }
+                })
+            } else if !is_remote_origin(url) && !url.starts_with("flux://") {
+                fs::read(&resolved).ok()
+            } else {
+                None
+            };
+            if let Some(bytes) = raw_bytes {
+                if !verify_subresource_integrity(integrity.as_deref(), &bytes) {
+                    blocked_csp_count += 1;
+                    continue;
+                }
+                if let Ok(code) = String::from_utf8(bytes) {
+                    runtime.eval_script(&mut document, &code);
+                }
             }
         }
-    }
-    if csp.allows_inline_script() {
-        runtime.run_document_scripts(&mut document);
-    } else if !document.scripts().is_empty() {
-        blocked_csp_count += document.scripts().len();
+        if csp.allows_inline_script() {
+            runtime.run_document_scripts(&mut document);
+        } else if !document.scripts().is_empty() {
+            blocked_csp_count += document.scripts().len();
+        }
     }
 
     for (img_id, src) in document.images() {
@@ -724,6 +750,31 @@ pub fn render_html_with_resources_csp_and_storage(
 
 /// GET `url` with `flux-net`, fetch allowed stylesheets and images, then render.
 pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
+    load_url_with_cookies(url, viewport, None)
+}
+
+/// GET `url` like [`load_url`]. Script `fetch()` inside the worker does not
+/// see `fetch_jar`. The jar stays in this process for later page loads.
+pub fn load_url_with_cookies(
+    url: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, BrowserError> {
+    load_url_for_navigation(url, viewport, fetch_jar, true, 0)
+}
+
+/// GET `url`, then run the document in `--tab-worker`.
+///
+/// Stylesheets and images are fetched in this process after the worker
+/// returns. A worker failure is [`BrowserError::Worker`] and does not render
+/// the fetched HTML here.
+pub fn load_url_for_navigation(
+    url: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+) -> Result<Page, BrowserError> {
     let (final_url, response) = fetch(url).map_err(BrowserError::Net)?;
     if !(200..300).contains(&response.status) {
         return Err(BrowserError::Status(response.status));
@@ -732,35 +783,48 @@ pub fn load_url(url: &str, viewport: Viewport) -> Result<Page, BrowserError> {
         .header("content-security-policy")
         .map(str::to_string);
     let html = String::from_utf8(response.body).map_err(|_| BrowserError::Utf8)?;
-    let parsed_doc = flux_dom::parse_html(&html);
-    let combined_csp_raw = match (http_csp.as_deref(), parsed_doc.meta_csp()) {
-        (Some(h), Some(m)) => format!("{h}; {m}"),
-        (Some(h), None) => h.to_string(),
-        (None, Some(m)) => m,
-        (None, None) => String::new(),
-    };
-    let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
-    let mut blocked = 0usize;
-    let external_css = fetch_linked_stylesheets(
+    let program = worker::current_flux_exe().map_err(BrowserError::Worker)?;
+    render_through_tab_worker(
+        &program,
+        &["--tab-worker".to_string()],
+        worker::worker_timeout(),
+        tab_id,
         &final_url,
-        &parsed_doc.stylesheet_links_with_integrity(),
-        &csp,
-        &mut blocked,
-    );
-    let images = fetch_page_images(&final_url, &parsed_doc.images(), &csp, &mut blocked);
-    Ok(render_html_with_resources_and_csp(
         &html,
-        &external_css,
-        images,
-        &final_url,
-        viewport,
         http_csp.as_deref(),
-        blocked,
-    ))
+        scripts_enabled,
+        viewport,
+        fetch_jar,
+    )
+    .map_err(BrowserError::Worker)
 }
 
 /// POST `body` when `url` is http(s). Any other URL calls `load_target` and ignores `body`.
 pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Page, String> {
+    load_post_target_with_cookies(url, body, viewport, None)
+}
+
+/// POST like [`load_post_target`]. The worker does not receive `fetch_jar`.
+pub fn load_post_target_with_cookies(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    load_post_for_navigation(url, body, viewport, fetch_jar, true, 0)
+}
+
+/// POST `body`, then run the response document in `--tab-worker`.
+///
+/// A worker failure is `Err` and does not render the response HTML here.
+pub fn load_post_for_navigation(
+    url: &str,
+    body: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+) -> Result<Page, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let (final_url, response) =
             fetch_post(url, "application/x-www-form-urlencoded", body.as_bytes())
@@ -773,34 +837,154 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
             .map(str::to_string);
         let html =
             String::from_utf8(response.body).map_err(|_| "the page was not text".to_string())?;
-        let parsed_doc = flux_dom::parse_html(&html);
-        let combined_csp_raw = match (http_csp.as_deref(), parsed_doc.meta_csp()) {
-            (Some(h), Some(m)) => format!("{h}; {m}"),
-            (Some(h), None) => h.to_string(),
-            (None, Some(m)) => m,
-            (None, None) => String::new(),
-        };
-        let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
-        let mut blocked = 0usize;
-        let external_css = fetch_linked_stylesheets(
+        let program = worker::current_flux_exe()?;
+        render_through_tab_worker(
+            &program,
+            &["--tab-worker".to_string()],
+            worker::worker_timeout(),
+            tab_id,
             &final_url,
-            &parsed_doc.stylesheet_links_with_integrity(),
-            &csp,
-            &mut blocked,
-        );
-        let images = fetch_page_images(&final_url, &parsed_doc.images(), &csp, &mut blocked);
-        Ok(render_html_with_resources_and_csp(
             &html,
-            &external_css,
-            images,
-            &final_url,
-            viewport,
             http_csp.as_deref(),
-            blocked,
-        ))
+            scripts_enabled,
+            viewport,
+            fetch_jar,
+        )
     } else {
-        load_target(url, viewport)
+        load_target_with_cookies(url, viewport, fetch_jar)
     }
+}
+
+/// Run `html` in `program` and paint the document it returns.
+///
+/// `html` is the source sent to the worker. It is not rendered when the
+/// worker times out, returns `ok: false`, or writes a bad frame. The cookie
+/// jar is not sent. Subresources of the returned document are fetched here.
+#[allow(clippy::too_many_arguments)]
+pub fn render_through_tab_worker(
+    program: &Path,
+    args: &[String],
+    timeout: Duration,
+    tab_id: u64,
+    url: &str,
+    html: &str,
+    csp_header: Option<&str>,
+    scripts_enabled: bool,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    let request = TabWorkerRequest {
+        tab_id,
+        url: url.to_string(),
+        html: html.to_string(),
+        scripts_enabled,
+        csp_header: csp_header.map(str::to_string),
+        viewport_width: viewport.width.round().max(1.0) as u32,
+        viewport_height: viewport.height.round().max(1.0) as u32,
+    };
+    let resp = worker::exchange_tab_worker(program, args, &request, timeout)?;
+    if resp.tab_id != tab_id {
+        return Err("tab worker returned a different tab id".to_string());
+    }
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "tab worker rejected the page".to_string()));
+    }
+    Ok(paint_worker_document(
+        &resp.html,
+        url,
+        viewport,
+        csp_header,
+        fetch_jar,
+        resp.blocked_csp_resources,
+    ))
+}
+
+/// Lay out `html` without running scripts. `html` is the worker's document.
+fn paint_worker_document(
+    html: &str,
+    url: &str,
+    viewport: Viewport,
+    http_csp: Option<&str>,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    blocked_from_worker: usize,
+) -> Page {
+    let parsed = flux_dom::parse_html(html);
+    let combined_csp_raw = match (http_csp, parsed.meta_csp()) {
+        (Some(h), Some(m)) => format!("{h}; {m}"),
+        (Some(h), None) => h.to_string(),
+        (None, Some(m)) => m,
+        (None, None) => String::new(),
+    };
+    let csp = ContentSecurityPolicy::parse(&combined_csp_raw);
+    let mut blocked = blocked_from_worker;
+    let external_css = fetch_linked_stylesheets(
+        url,
+        &parsed.stylesheet_links_with_integrity(),
+        &csp,
+        &mut blocked,
+    );
+    let images = fetch_page_images(url, &parsed.images(), &csp, &mut blocked);
+    render_html_with_resources_csp_and_storage(
+        html,
+        &external_css,
+        images,
+        url,
+        viewport,
+        http_csp,
+        blocked,
+        &[],
+        fetch_jar,
+        false,
+    )
+}
+
+/// Page shown when a remote navigation does not come back from the worker.
+///
+/// `reason` is escaped and inserted as text. The failed document is not part
+/// of this page.
+pub fn navigation_error_page(url: &str, reason: &str, viewport: Viewport) -> Page {
+    let html = format!(
+        "<!DOCTYPE html>
+<html>
+<head>
+  <title>Navigation failed</title>
+  <style>
+    html, body {{ margin: 0; padding: 24px; background-color: #0e1015; color: #eceff4; font-size: 15px; }}
+    .card {{ background-color: #171b24; border: 1px solid #d08770; border-radius: 10px; padding: 20px; }}
+    h1 {{ color: #ebcb8b; font-size: 20px; margin-bottom: 10px; }}
+    p {{ color: #d8dee9; margin-bottom: 8px; }}
+    a {{ color: #88c0d0; }}
+  </style>
+</head>
+<body>
+  <div class=\"card\">
+    <h1>Navigation failed</h1>
+    <p>Target: {url}</p>
+    <p>Reason: {reason}</p>
+    <p><a href=\"flux://home\">Return to Start</a></p>
+  </div>
+</body>
+</html>",
+        url = escape_error_text(url),
+        reason = escape_error_text(reason),
+    );
+    render_html(&html, url, viewport)
+}
+
+/// Escape text that is inserted into the error page.
+fn escape_error_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Load a built-in page, an http(s) URL, or a local HTML file.
@@ -808,14 +992,36 @@ pub fn load_post_target(url: &str, body: &str, viewport: Viewport) -> Result<Pag
 /// `flux://navigate` is resolved with Google Search, not the session engine.
 /// `Session::open_target` handles that prefix itself before it calls this function.
 pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
+    load_target_with_cookies(target, viewport, None)
+}
+
+/// Load like [`load_target`]. Script `fetch()` uses `fetch_jar` when it is set.
+/// http(s) targets use `--tab-worker` with scripts enabled.
+pub fn load_target_with_cookies(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+) -> Result<Page, String> {
+    load_target_for_navigation(target, viewport, fetch_jar, true, 0)
+}
+
+/// Load `target`. http(s) goes through `--tab-worker`. Other targets stay here.
+pub fn load_target_for_navigation(
+    target: &str,
+    viewport: Viewport,
+    fetch_jar: Option<Arc<Mutex<CookieJar>>>,
+    scripts_enabled: bool,
+    tab_id: u64,
+) -> Result<Page, String> {
     if let Some(dest) = frontend::resolve_navigation_query(target) {
-        return load_target(&dest, viewport);
+        return load_target_for_navigation(&dest, viewport, fetch_jar, scripts_enabled, tab_id);
     }
     if let Some((canonical_url, html)) = frontend::resolve_builtin_page(target) {
         return Ok(render_html(&html, &canonical_url, viewport));
     }
     if target.starts_with("http://") || target.starts_with("https://") {
-        load_url(target, viewport).map_err(|err| err.to_string())
+        load_url_for_navigation(target, viewport, fetch_jar, scripts_enabled, tab_id)
+            .map_err(|err| err.to_string())
     } else {
         let html =
             fs::read_to_string(target).map_err(|err| format!("could not read {target}: {err}"))?;
@@ -837,7 +1043,91 @@ pub fn load_target(target: &str, viewport: Viewport) -> Result<Page, String> {
             viewport,
             None,
             blocked,
+            fetch_jar,
         ))
+    }
+}
+
+/// Same-origin script `fetch()` goes through `flux-net` and `fetch_jar`.
+///
+/// A missing jar still gets a jar for this page, so `Set-Cookie` from the
+/// script response is kept on the page host. Cross-origin redirects are not
+/// followed. The Rust interpreter calls this. The numeric VM does not.
+fn bind_script_fetch(runtime: &mut ScriptRuntime, fetch_jar: Option<Arc<Mutex<CookieJar>>>) {
+    let jar = fetch_jar.unwrap_or_else(|| Arc::new(Mutex::new(CookieJar::new())));
+    runtime.set_fetch_host(Arc::new(move |url, page| script_net_fetch(url, page, &jar)));
+}
+
+fn script_net_fetch(url: &str, page: &str, jar: &Arc<Mutex<CookieJar>>) -> ScriptFetchReply {
+    let mut current = url.trim().to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        if !is_same_origin(page, &current) {
+            return ScriptFetchReply {
+                status: 403,
+                body: "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
+            };
+        }
+        if is_url_blocked_by_default_shield(&current, Some(page)).is_some() {
+            return ScriptFetchReply {
+                status: 0,
+                body: String::new(),
+            };
+        }
+        let Ok(parsed) = parse_url(&current) else {
+            return ScriptFetchReply {
+                status: 0,
+                body: String::new(),
+            };
+        };
+        let cookie_hdr = {
+            let guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            guard.http_cookie_header(&current, Some(page), false)
+        };
+        let Ok(response) = http_get_with_cookie(&parsed, cookie_hdr.as_deref()) else {
+            return ScriptFetchReply {
+                status: 0,
+                body: String::new(),
+            };
+        };
+        {
+            let mut guard = jar.lock().unwrap_or_else(|err| err.into_inner());
+            for set_cookie in response.headers_named("set-cookie") {
+                guard.store_set_cookie(&current, set_cookie);
+            }
+        }
+        if matches!(response.status, 301 | 302 | 303 | 307 | 308) {
+            let Some(location) = response.header("location") else {
+                return ScriptFetchReply {
+                    status: response.status,
+                    body: String::new(),
+                };
+            };
+            let Some(next) = resolve_url(&current, location) else {
+                return ScriptFetchReply {
+                    status: 0,
+                    body: String::new(),
+                };
+            };
+            // A cross-origin hop is not connected.
+            if !is_same_origin(page, &next) {
+                return ScriptFetchReply {
+                    status: 403,
+                    body: "{\"error\":\"same-origin policy blocked fetch\"}".to_string(),
+                };
+            }
+            current = next;
+            continue;
+        }
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        limit_script_fetch_body(&mut body);
+        return ScriptFetchReply {
+            status: response.status,
+            body,
+        };
+    }
+    ScriptFetchReply {
+        status: 0,
+        body: String::new(),
     }
 }
 
@@ -1153,7 +1443,7 @@ pub struct Session {
     settings: BrowserSettings,
     gpu_video: GpuVideoSession,
     sandbox_guard: MandatorySandboxGuard,
-    cookie_jar: CookieJar,
+    cookie_jar: Arc<Mutex<CookieJar>>,
     network_shield: NetworkShield,
     hsts_store: HstsStore,
     downloads: DownloadManager,
@@ -1177,7 +1467,7 @@ impl Session {
             settings: BrowserSettings::default(),
             gpu_video: GpuVideoSession::default(),
             sandbox_guard,
-            cookie_jar: CookieJar::new(),
+            cookie_jar: Arc::new(Mutex::new(CookieJar::new())),
             network_shield: NetworkShield::new(),
             hsts_store: HstsStore::new(),
             downloads: DownloadManager::new(),
@@ -1217,14 +1507,21 @@ impl Session {
         self.sandbox_guard.telemetry()
     }
 
-    /// Borrow the cookie jar.
-    pub fn cookie_jar(&self) -> &CookieJar {
-        &self.cookie_jar
+    /// Lock the session cookie jar.
+    pub fn cookie_jar(&self) -> MutexGuard<'_, CookieJar> {
+        self.cookie_jar
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
     }
 
-    /// Mutable cookie jar.
-    pub fn cookie_jar_mut(&mut self) -> &mut CookieJar {
-        &mut self.cookie_jar
+    /// Lock the session cookie jar.
+    pub fn cookie_jar_mut(&mut self) -> MutexGuard<'_, CookieJar> {
+        self.cookie_jar()
+    }
+
+    /// Shared handle used by script `fetch()` on this session.
+    pub fn cookie_jar_handle(&self) -> Arc<Mutex<CookieJar>> {
+        Arc::clone(&self.cookie_jar)
     }
 
     /// Borrow the network shield.
@@ -1840,12 +2137,19 @@ impl Session {
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
         let seeded_storage = self.local_storage.clone();
+        let fetch_jar = self.cookie_jar_handle();
         let page = match self.sandbox_guard.execute_isolated(&label, || {
-            Ok(render_html_with_storage(
+            Ok(render_html_with_resources_csp_and_storage(
                 html,
+                "",
+                HashMap::new(),
                 url,
                 viewport,
+                None,
+                0,
                 &seeded_storage,
+                Some(fetch_jar.clone()),
+                true,
             ))
         }) {
             Ok(p) => p,
@@ -1877,15 +2181,27 @@ impl Session {
         let upgraded = self.hsts_store.upgrade_url_if_hsts(url.trim());
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
-        match self
-            .sandbox_guard
-            .execute_isolated(&label, || Ok(load_url(&upgraded, viewport)))
-        {
+        let fetch_jar = self.cookie_jar_handle();
+        let scripts_enabled = self.settings.scripts_enabled;
+        let tab_id = self.active as u64;
+        match self.sandbox_guard.execute_isolated(&label, || {
+            Ok(load_url_for_navigation(
+                &upgraded,
+                viewport,
+                Some(fetch_jar.clone()),
+                scripts_enabled,
+                tab_id,
+            ))
+        }) {
             Ok(Ok(page)) => {
                 self.open_page(page);
                 Ok(())
             }
-            Ok(Err(err)) => Err(err),
+            Ok(Err(err)) => {
+                let page = navigation_error_page(&upgraded, &err.to_string(), viewport);
+                self.open_page(page);
+                Ok(())
+            }
             Err(sandbox_err) => {
                 let page =
                     render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
@@ -1899,8 +2215,9 @@ impl Session {
     ///
     /// Settings query flags toggle in-memory settings and then render the settings
     /// page. Sample download actions only record bytes. They do not save a file.
-    /// http(s) and files go through `load_target` inside `execute_isolated`.
-    /// This does not spawn `--tab-worker`.
+    /// http(s) goes through `--tab-worker` inside `execute_isolated`. Files and
+    /// `flux://` pages stay in this process. A failed remote load opens an
+    /// error page and does not paint the document.
     pub fn open_target(&mut self, target: &str) -> Result<(), String> {
         let trimmed = target.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -1945,7 +2262,7 @@ impl Session {
                 self.network_shield.blocked_total(),
                 self.hsts_store.len(),
                 self.downloads.entries().len(),
-                self.cookie_jar.len(),
+                self.cookie_jar().len(),
             );
             let page = render_html_with_storage(
                 &html,
@@ -1993,7 +2310,7 @@ impl Session {
                 self.gpu_video.frames_encoded().max(12),
                 self.bookmarks.len(),
                 self.history_log.len(),
-                self.cookie_jar.len(),
+                self.cookie_jar().len(),
             );
             let mut page =
                 render_html_with_storage(&html, trimmed, self.viewport, &self.local_storage);
@@ -2058,15 +2375,27 @@ impl Session {
         }
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
-        match self
-            .sandbox_guard
-            .execute_isolated(&label, || Ok(load_target(&upgraded, viewport)))
-        {
+        let fetch_jar = self.cookie_jar_handle();
+        let scripts_enabled = self.settings.scripts_enabled;
+        let tab_id = self.active as u64;
+        match self.sandbox_guard.execute_isolated(&label, || {
+            Ok(load_target_for_navigation(
+                &upgraded,
+                viewport,
+                Some(fetch_jar.clone()),
+                scripts_enabled,
+                tab_id,
+            ))
+        }) {
             Ok(Ok(page)) => {
                 self.open_page(page);
                 Ok(())
             }
-            Ok(Err(err)) => Err(err),
+            Ok(Err(err)) => {
+                let page = navigation_error_page(&upgraded, &err, viewport);
+                self.open_page(page);
+                Ok(())
+            }
             Err(sandbox_err) => {
                 let page =
                     render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
@@ -2131,7 +2460,7 @@ impl Session {
             tab_urls,
             bookmarks: self.bookmarks.clone(),
             history_log: self.history_log.clone(),
-            cookie_jar: self.cookie_jar.clone(),
+            cookie_jar: self.cookie_jar().clone(),
             hsts_store: self.hsts_store.clone(),
             downloads: self.downloads.clone(),
             local_storage: self.local_storage.clone(),
@@ -2158,7 +2487,7 @@ impl Session {
                 self.history_log.push(entry);
             }
         }
-        self.cookie_jar = snapshot.cookie_jar;
+        *self.cookie_jar_mut() = snapshot.cookie_jar;
         self.hsts_store = snapshot.hsts_store;
         self.downloads = snapshot.downloads;
         self.merge_local_storage(snapshot.local_storage);
@@ -2207,7 +2536,7 @@ impl Session {
     pub fn clear_all_profile_data(&mut self) {
         self.bookmarks.clear();
         self.history_log.clear();
-        self.cookie_jar = CookieJar::new();
+        *self.cookie_jar_mut() = CookieJar::new();
         self.hsts_store = HstsStore::new();
         self.downloads.clear();
         self.local_storage.clear();
@@ -2230,16 +2559,29 @@ impl Session {
         let upgraded = self.hsts_store.upgrade_url_if_hsts(&target);
         let viewport = self.viewport;
         let label = format!("tab-{}", self.active);
-        match self
-            .sandbox_guard
-            .execute_isolated(&label, || Ok(load_target(&upgraded, viewport)))
-        {
+        let fetch_jar = self.cookie_jar_handle();
+        let scripts_enabled = self.settings.scripts_enabled;
+        let tab_id = self.active as u64;
+        match self.sandbox_guard.execute_isolated(&label, || {
+            Ok(load_target_for_navigation(
+                &upgraded,
+                viewport,
+                Some(fetch_jar.clone()),
+                scripts_enabled,
+                tab_id,
+            ))
+        }) {
             Ok(Ok(page)) => {
                 self.tabs[self.active].replace_current(page);
                 self.scroll = self.scroll.clamp(0.0, self.max_scroll());
                 Ok(())
             }
-            Ok(Err(err)) => Err(err),
+            Ok(Err(err)) => {
+                let page = navigation_error_page(&upgraded, &err, viewport);
+                self.tabs[self.active].replace_current(page);
+                self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+                Ok(())
+            }
             Err(sandbox_err) => {
                 let page =
                     render_sandbox_recovery_page(&upgraded, &sandbox_err.to_string(), viewport);
@@ -2374,9 +2716,27 @@ mod tests {
     use flux_style::Color;
 
     #[test]
-    /// `VERSION` is the string `v.17`.
-    fn release_is_v17() {
-        assert_eq!(VERSION, "v.17");
+    /// `VERSION` is the string `v.18`.
+    fn release_is_v18() {
+        assert_eq!(VERSION, "v.18");
+    }
+
+    #[test]
+    /// A failed navigation page is the error text, not the document that failed.
+    fn navigation_failure_page_omits_the_document() {
+        let secret = "secret-marker-not-painted";
+        let page = navigation_error_page(
+            "http://127.0.0.1/page",
+            "tab worker timed out",
+            Viewport {
+                width: 320.0,
+                height: 200.0,
+            },
+        );
+        let text = page.document.text_content(page.document.body());
+        assert_eq!(page.title, "Navigation failed");
+        assert!(text.contains("timed out"));
+        assert!(!text.contains(secret));
     }
 
     #[test]
@@ -2395,7 +2755,7 @@ mod tests {
             "https://example.com/dashboard.html",
         );
         assert!(session.local_storage_entries().contains(&(
-            "https://example.com".to_string(),
+            "https://example.com:443".to_string(),
             "theme".to_string(),
             "obsidian-gold".to_string()
         )));
@@ -2419,6 +2779,72 @@ mod tests {
         let page = restored.active().current().unwrap();
         let node = page.document.get_element_by_id("restored").unwrap();
         assert_eq!(page.document.text_content(node), "obsidian-gold");
+    }
+
+    #[test]
+    fn profile_hides_other_origins_and_omits_session_storage() {
+        let mut session = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        session.open_html(
+            "<p id=\"out\"></p>
+             <script>
+               localStorage.setItem('token', 'alpha-token');
+               sessionStorage.setItem('tab', 'ephemeral-marker');
+               document.getElementById('out').textContent = localStorage.getItem('token');
+             </script>",
+            "https://alpha.example/home",
+        );
+        session.open_html(
+            "<p id=\"out\"></p>
+             <script>
+               document.getElementById('out').textContent = localStorage.getItem('token');
+             </script>",
+            "https://beta.example/home",
+        );
+        let hidden = session.active().current().unwrap();
+        let hidden_node = hidden.document.get_element_by_id("out").unwrap();
+        assert_eq!(hidden.document.text_content(hidden_node), "null");
+
+        let json = profile::snapshot_to_json(&session.to_profile_snapshot());
+        assert!(json.contains("alpha-token"));
+        assert!(!json.contains("ephemeral-marker"));
+        assert!(!json.contains("session_storage"));
+        assert!(!json.contains("sessionStorage"));
+
+        let encrypted = profile::encode_encrypted_profile(
+            &session.to_profile_snapshot(),
+            0x99aa_bbcc_ddee_ff00,
+        );
+        let decoded = profile::decode_profile_bytes(&encrypted).expect("decode profile");
+        let mut restored = Session::new(Viewport {
+            width: 800.0,
+            height: 600.0,
+        });
+        restored.apply_profile_snapshot(decoded);
+        restored.open_html(
+            "<p id=\"out\"></p>
+             <script>
+               document.getElementById('out').textContent =
+                 localStorage.getItem('token') + ':' + sessionStorage.getItem('tab');
+             </script>",
+            "https://alpha.example/again",
+        );
+        let alpha = restored.active().current().unwrap();
+        let alpha_node = alpha.document.get_element_by_id("out").unwrap();
+        assert_eq!(alpha.document.text_content(alpha_node), "alpha-token:null");
+
+        restored.open_html(
+            "<p id=\"out\"></p>
+             <script>
+               document.getElementById('out').textContent = localStorage.getItem('token');
+             </script>",
+            "https://beta.example/again",
+        );
+        let beta = restored.active().current().unwrap();
+        let beta_node = beta.document.get_element_by_id("out").unwrap();
+        assert_eq!(beta.document.text_content(beta_node), "null");
     }
 
     #[test]
@@ -3024,5 +3450,62 @@ mod tests {
             restored.bookmarks()[0].url,
             "https://example.com/index.html"
         );
+    }
+
+    #[test]
+    fn script_fetch_reads_same_origin_http_and_does_not_connect_cross_origin() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let body = b"harbor-token";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSet-Cookie: harbor=token; Path=/\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(header.as_bytes());
+            let _ = sock.write_all(body);
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        });
+
+        let blocked = TcpListener::bind("127.0.0.1:0").unwrap();
+        blocked.set_nonblocking(true).unwrap();
+        let blocked_addr = blocked.local_addr().unwrap();
+
+        let origin = format!("http://127.0.0.1:{}/index.html", addr.port());
+        let html = format!(
+            "<p id=\"out\"></p>
+             <script>
+               let ok = fetch('http://127.0.0.1:{}/note');
+               let denied = fetch('http://127.0.0.1:{}/secret');
+               document.getElementById('out').textContent = ok.body + ':' + denied.status;
+             </script>",
+            addr.port(),
+            blocked_addr.port()
+        );
+        let mut session = Session::new(Viewport {
+            width: 200.0,
+            height: 80.0,
+        });
+        session.open_html(&html, &origin);
+        let page = session.active().current().unwrap();
+        let out = page.document.get_element_by_id("out").unwrap();
+        assert_eq!(page.document.text_content(out), "harbor-token:403");
+        assert!(
+            session
+                .cookie_jar()
+                .cookies()
+                .iter()
+                .any(|cookie| cookie.name == "harbor" && cookie.value == "token")
+        );
+        assert!(blocked.accept().unwrap_err().kind() == std::io::ErrorKind::WouldBlock);
     }
 }

@@ -5,9 +5,11 @@
 //! run inside [`MandatorySandboxGuard::execute_isolated`], which is
 //! `catch_unwind` in this same process. It does not spawn a process. Tabs are
 //! still drawn by the window. This crate never starts `--tab-worker`.
-//! `flux-browser` only enters that path when the process was launched with
-//! the flag. The `FLUXIPC1` request and response types are the wire format
-//! for that mode. They are not evidence that a tab is out of process.
+//! `flux-browser` enters that path when this process was launched with the
+//! flag. The window also starts that process for one http(s) navigation and
+//! waits [`MANDATORY_WORKER_TIMEOUT_MS`]. This crate never starts it. The
+//! `FLUXIPC1` types are the wire format. One worker process is not a
+//! multi-process sandbox for the window.
 //!
 //! Windows puts the window process in a Job Object with a 2 GiB process
 //! memory cap, kill-on-job-close, and die-on-unhandled-exception. That job
@@ -52,8 +54,8 @@ pub const MANDATORY_IPC_MAX_JSON_DEPTH: usize = 32;
 
 /// Worker time budget, in milliseconds.
 ///
-/// Nothing in this crate reads it. The window does not start a timer from it,
-/// and `--tab-worker` does not either.
+/// This crate does not start a timer. `flux-browser` waits this long for one
+/// `--tab-worker` frame during a remote navigation, then kills the process.
 pub const MANDATORY_WORKER_TIMEOUT_MS: u64 = 5_000;
 
 /// Eight-byte header of every worker frame. The next four bytes are a little-endian length.
@@ -148,9 +150,14 @@ pub struct MandatorySandboxGuard {
 #[cfg(target_os = "windows")]
 impl Drop for MandatorySandboxGuard {
     /// Close the window Job Object. A zero handle means it was already closed.
+    ///
+    /// `KILL_ON_JOB_CLOSE` is cleared first. The process that owns the guard is
+    /// in this job, so leaving the flag set would terminate it inside `Drop`
+    /// and hide the result of a test. A tab worker breaks away into its own job.
     fn drop(&mut self) {
         if self.job_handle != 0 {
             unsafe {
+                disarm_window_job_kill(self.job_handle);
                 CloseHandle(self.job_handle);
             }
             self.job_handle = 0;
@@ -346,11 +353,13 @@ pub fn lock_current_worker_process_or_abort() {
     }
 }
 
-/// JSON object a parent could send to a `--tab-worker` process.
+/// JSON object a parent sends to a `--tab-worker` process.
 ///
-/// Fields are `tab_id`, `url`, `html`, `scripts_enabled`, and `csp_header`.
-/// Defining this type does not spawn a worker. `flux-browser` reads one of
-/// these only after it was started with `--tab-worker`.
+/// Fields are `tab_id`, `url`, `html`, `scripts_enabled`, `csp_header`,
+/// `viewport_width`, and `viewport_height`. The HTML is the document the
+/// parent already fetched. The cookie jar is not in this object.
+/// `flux-browser` writes one of these for an http(s) navigation. Defining the
+/// type does not spawn a worker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerRequest {
     pub tab_id: u64,
@@ -358,12 +367,18 @@ pub struct TabWorkerRequest {
     pub html: String,
     pub scripts_enabled: bool,
     pub csp_header: Option<String>,
+    /// CSS pixel width. Zero is treated as 1 by the worker.
+    pub viewport_width: u32,
+    /// CSS pixel height. Zero is treated as 1 by the worker.
+    pub viewport_height: u32,
 }
 
 /// JSON object a `--tab-worker` process writes back.
 ///
 /// Fields are `tab_id`, `ok`, `title`, `dom_nodes`, `blocked_csp_resources`,
-/// and `error`. The window's normal tab path does not exchange these frames.
+/// `error`, and `html`. `html` is the document after scripts when `ok` is
+/// true. The window paints that HTML only after a successful frame. A failed
+/// or missing frame does not include the document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabWorkerResponse {
     pub tab_id: u64,
@@ -372,6 +387,8 @@ pub struct TabWorkerResponse {
     pub dom_nodes: usize,
     pub blocked_csp_resources: usize,
     pub error: Option<String>,
+    /// Post-script document. Empty when `ok` is false.
+    pub html: String,
 }
 
 impl TabWorkerRequest {
@@ -386,11 +403,20 @@ impl TabWorkerRequest {
             Some(csp) => obj.insert("csp_header", JsonValue::String(csp.clone())),
             None => obj.insert("csp_header", JsonValue::Null),
         }
+        obj.insert(
+            "viewport_width",
+            JsonValue::Number(self.viewport_width as f64),
+        );
+        obj.insert(
+            "viewport_height",
+            JsonValue::Number(self.viewport_height as f64),
+        );
         obj
     }
 
     /// Read a request. `tab_id`, `url`, and `html` are required.
     /// `scripts_enabled` defaults to true. `csp_header` is optional.
+    /// Missing viewport fields default to 960 by 720.
     pub fn from_json(val: &JsonValue) -> Result<Self, SandboxError> {
         let tab_id = val.get_u64("tab_id").ok_or(SandboxError::IpcFramingError(
             "missing tab_id in worker request",
@@ -409,12 +435,16 @@ impl TabWorkerRequest {
             .to_string();
         let scripts_enabled = val.get_bool("scripts_enabled").unwrap_or(true);
         let csp_header = val.get_str("csp_header").map(ToString::to_string);
+        let viewport_width = val.get_u64("viewport_width").unwrap_or(960) as u32;
+        let viewport_height = val.get_u64("viewport_height").unwrap_or(720) as u32;
         Ok(Self {
             tab_id,
             url,
             html,
             scripts_enabled,
             csp_header,
+            viewport_width,
+            viewport_height,
         })
     }
 }
@@ -435,6 +465,7 @@ impl TabWorkerResponse {
             Some(err) => obj.insert("error", JsonValue::String(err.clone())),
             None => obj.insert("error", JsonValue::Null),
         }
+        obj.insert("html", JsonValue::String(self.html.clone()));
         obj
     }
 
@@ -451,6 +482,7 @@ impl TabWorkerResponse {
         let dom_nodes = val.get_u64("dom_nodes").unwrap_or(0) as usize;
         let blocked_csp_resources = val.get_u64("blocked_csp_resources").unwrap_or(0) as usize;
         let error = val.get_str("error").map(ToString::to_string);
+        let html = val.get_str("html").unwrap_or("").to_string();
         Ok(Self {
             tab_id,
             ok,
@@ -458,6 +490,7 @@ impl TabWorkerResponse {
             dom_nodes,
             blocked_csp_resources,
             error,
+            html,
         })
     }
 }
@@ -510,8 +543,8 @@ pub fn decode_ipc_frame(frame: &[u8]) -> Result<JsonValue, SandboxError> {
 
 /// Write one frame and flush. A short write is `IpcFramingError`.
 ///
-/// The `--tab-worker` process uses this on stdout. The window does not call it
-/// during normal browsing.
+/// The `--tab-worker` process uses this on stdout. The window uses it to send
+/// one request for an http(s) navigation.
 pub fn write_ipc_frame<W: Write>(writer: &mut W, payload: &JsonValue) -> Result<(), SandboxError> {
     let frame = encode_ipc_frame(payload)?;
     writer
@@ -558,6 +591,8 @@ fn verify_ipc_self_test() -> Result<(), SandboxError> {
         html: "<p>sandbox self-test</p>".to_string(),
         scripts_enabled: true,
         csp_header: Some("default-src 'self'".to_string()),
+        viewport_width: 960,
+        viewport_height: 720,
     };
     let frame = encode_ipc_frame(&req.to_json())?;
     let decoded_json = decode_ipc_frame(&frame)?;
@@ -591,6 +626,9 @@ const JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION: u32 = 0x0000_0400;
 #[cfg(target_os = "windows")]
 /// Limit flag: closing the last job handle kills assigned processes. Both jobs.
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+#[cfg(target_os = "windows")]
+/// Limit flag: a child may pass `CREATE_BREAKAWAY_FROM_JOB`. Window job only.
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
 
 #[cfg(target_os = "windows")]
 /// All basic UI restriction bits (0xFF). Clipboard, desktop, handles, and exits. Worker only.
@@ -667,6 +705,24 @@ unsafe extern "system" {
     fn CloseHandle(handle: isize) -> i32;
 }
 
+/// Drop `KILL_ON_JOB_CLOSE` so closing the handle does not terminate this process.
+#[cfg(target_os = "windows")]
+fn disarm_window_job_kill(job: isize) {
+    let mut ext = JobObjectExtendedLimitInformation::default();
+    ext.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+        | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+    ext.process_memory_limit = UI_ADDRESS_SPACE_LIMIT_BYTES;
+    unsafe {
+        let _ = SetInformationJobObject(
+            job,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            (&ext as *const JobObjectExtendedLimitInformation).cast(),
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+        );
+    }
+}
+
 /// Apply extended limits. On failure the job handle is closed and an error is returned.
 #[cfg(target_os = "windows")]
 fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result<(), SandboxError> {
@@ -691,7 +747,10 @@ fn set_job_limits(job: isize, ext: &JobObjectExtendedLimitInformation) -> Result
 
 /// Window job: 2 GiB process memory, die on unhandled exception, kill when the job closes.
 ///
-/// No active-process limit and no UI restriction class. Returns the handle and the byte cap.
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK` lets a child started with
+/// `CREATE_BREAKAWAY_FROM_JOB` leave this job. The tab worker uses that so it
+/// can enter its own job. No active-process limit and no UI restriction class.
+/// Returns the handle and the byte cap.
 #[cfg(target_os = "windows")]
 fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -703,7 +762,8 @@ fn create_windows_ui_job() -> Result<(isize, usize), SandboxError> {
     let mut ext = JobObjectExtendedLimitInformation::default();
     ext.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
         | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
-        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
     ext.process_memory_limit = UI_ADDRESS_SPACE_LIMIT_BYTES;
     set_job_limits(job, &ext)?;
     Ok((job, UI_ADDRESS_SPACE_LIMIT_BYTES))
@@ -902,6 +962,7 @@ mod tests {
             dom_nodes: 128,
             blocked_csp_resources: 2,
             error: None,
+            html: "<p>ok</p>".to_string(),
         };
         let mut pipe = Vec::new();
         write_ipc_frame(&mut pipe, &resp.to_json()).unwrap();

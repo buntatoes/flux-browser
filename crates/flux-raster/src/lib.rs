@@ -28,20 +28,20 @@ use flux_paint::{DisplayItem, DisplayList};
 pub use flux_style::Color;
 use flux_ttf::TtfFont;
 
-/// Scanline and compositor entry points from `flux_raster_accel.cpp` and
-/// `flux_raster_compositor.cpp`. Present only when `build.rs` set `flux_cpp_accel`.
+// Scanline and compositor entry points from flux_raster_accel.cpp and
+// flux_raster_compositor.cpp. Present only when build.rs set flux_cpp_accel.
 #[cfg(flux_cpp_accel)]
 unsafe extern "C" {
-    /// Must return 16 or [`is_cpp_raster_kernel_active`] reports the kernel as off.
+    // Must return 16 or is_cpp_raster_kernel_active reports the kernel as off.
     fn flux_cpp_raster_kernel_version() -> u32;
-    /// Top-down RGBA to bottom-up BGRA. Used by [`Framebuffer::to_bgra_bottom_up`].
+    // Top-down RGBA to bottom-up BGRA. Used by Framebuffer::to_bgra_bottom_up.
     fn flux_cpp_rgba_to_bgra_bottom_up(
         src_rgba: *const u8,
         dst_bgra: *mut u8,
         width: u32,
         height: u32,
     );
-    /// Opaque or blended axis-aligned fill. The clip stack is applied in Rust first.
+    // Opaque or blended axis-aligned fill. The clip stack is applied in Rust first.
     fn flux_cpp_fill_rect_rgba(
         pixels: *mut u8,
         fb_width: u32,
@@ -55,7 +55,7 @@ unsafe extern "C" {
         b: u8,
         a: u8,
     );
-    /// Rounded fill plus optional border. Its SDF is local to the C++ file.
+    // Rounded fill plus optional border. Its SDF is local to the C++ file.
     fn flux_cpp_fill_rounded_rect_sdf(
         pixels: *mut u8,
         fb_width: u32,
@@ -79,7 +79,7 @@ unsafe extern "C" {
         border_b: u8,
         border_a: u8,
     );
-    /// Analytical SDF box-shadow scanline pass.
+    // Analytical SDF box-shadow scanline pass.
     fn flux_cpp_fill_box_shadow_sdf(
         pixels: *mut u8,
         fb_width: u32,
@@ -99,7 +99,7 @@ unsafe extern "C" {
         b: u8,
         a: u8,
     );
-    /// Rounded-rect two-stop linear gradient scanline pass.
+    // Rounded-rect two-stop linear gradient scanline pass.
     fn flux_cpp_fill_linear_gradient_sdf(
         pixels: *mut u8,
         fb_width: u32,
@@ -128,7 +128,7 @@ unsafe extern "C" {
         border_b: u8,
         border_a: u8,
     );
-    /// 8-bit coverage glyph bitmap blender.
+    // 8-bit coverage glyph bitmap blender.
     fn flux_cpp_blend_glyph_coverage(
         pixels: *mut u8,
         fb_width: u32,
@@ -147,7 +147,7 @@ unsafe extern "C" {
         b: u8,
         a: u8,
     );
-    /// Clipped RGBA image blitter with optional rounded-corner SDF mask.
+    // Clipped RGBA image blitter with optional rounded-corner SDF mask.
     fn flux_cpp_blit_rgba_clipped(
         dst_pixels: *mut u8,
         fb_width: u32,
@@ -163,7 +163,7 @@ unsafe extern "C" {
         src_h: u32,
         border_radius: f32,
     );
-    /// Semi-planar NV12 (Y + UV) to RGBA8 BT.709 color conversion.
+    // Semi-planar NV12 (Y + UV) to RGBA8 BT.709 color conversion.
     fn flux_cpp_nv12_to_rgba_bt709(
         y_plane: *const u8,
         uv_plane: *const u8,
@@ -351,10 +351,24 @@ impl Framebuffer {
         self.pixels[offset + 3] = 255;
     }
 
-    /// Fill an axis-aligned rectangle, clipped to the buffer and to the top clip.
-    pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
-        if width <= 0.0 || height <= 0.0 || color.a == 0 {
-            return;
+    /// Current clip, or the whole buffer when the clip stack is empty.
+    fn active_clip_bounds(&self) -> (i32, i32, i32, i32) {
+        self.clips
+            .last()
+            .copied()
+            .unwrap_or((0, 0, self.width as i32, self.height as i32))
+    }
+
+    /// Inclusive-exclusive pixel span for a rectangle after buffer and clip limits.
+    fn clipped_span(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if width <= 0.0 || height <= 0.0 {
+            return None;
         }
         let mut x0 = (x.floor() as i32).max(0);
         let mut y0 = (y.floor() as i32).max(0);
@@ -366,9 +380,27 @@ impl Framebuffer {
             x1 = x1.min(cx1);
             y1 = y1.min(cy1);
         }
-        if x0 >= x1 || y0 >= y1 {
+        (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+    }
+
+    /// Fill one clipped span on the CPU. Tests use this to compare with the C++ fill.
+    #[cfg(any(test, not(flux_cpp_accel)))]
+    fn fill_span_cpu(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        for py in y0..y1 {
+            for px in x0..x1 {
+                self.set_pixel(px, py, color);
+            }
+        }
+    }
+
+    /// Fill an axis-aligned rectangle, clipped to the buffer and to the top clip.
+    pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        if color.a == 0 {
             return;
         }
+        let Some((x0, y0, x1, y1)) = self.clipped_span(x, y, width, height) else {
+            return;
+        };
         #[cfg(flux_cpp_accel)]
         unsafe {
             flux_cpp_fill_rect_rgba(
@@ -387,11 +419,19 @@ impl Framebuffer {
             return;
         }
         #[cfg(not(flux_cpp_accel))]
-        for py in y0..y1 {
-            for px in x0..x1 {
-                self.set_pixel(px, py, color);
-            }
+        self.fill_span_cpu(x0, y0, x1, y1, color);
+    }
+
+    /// Same rectangle as [`Self::fill_rect`], always on the CPU loop.
+    #[cfg(test)]
+    fn fill_rect_cpu(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        if color.a == 0 {
+            return;
         }
+        let Some((x0, y0, x1, y1)) = self.clipped_span(x, y, width, height) else {
+            return;
+        };
+        self.fill_span_cpu(x0, y0, x1, y1, color);
     }
 
     /// Fill a rounded rectangle and blend a border when `border_width` is positive.
@@ -1412,5 +1452,87 @@ mod tests {
         fb.pop_clip();
         assert_eq!(fb.pixel(1, 1), Some(Color::BLACK));
         assert!(fb.pixel(2, 2).unwrap().r > 180);
+    }
+
+    #[test]
+    fn length_and_flex_rectangles_match_on_the_cpu_and_cpp_fills() {
+        use flux_dom::parse_html;
+        use flux_layout::layout_document;
+        use flux_paint::paint;
+        use flux_style::{compute_styles, parse_css};
+
+        let html = "<style>
+                html, body, div { margin: 0; padding: 0; }
+                html { font-size: 20px; }
+                #host { width: 200px; height: 100px; background: #111111; }
+                #pct { width: 50%; height: 40%; background: #ff0000; }
+                #em { font-size: 1.5rem; width: 2em; height: 10px; background: #00ff00; }
+                #row { display: flex; flex-wrap: wrap; width: 100px; background: #0000ff; }
+                #row div { width: 40px; height: 10px; }
+                #a { background: #aa0000; }
+                #b { background: #00aa00; }
+                #c { background: #0000aa; }
+                #grow { display: flex; width: 100px; height: 10px; }
+                #g1 { width: 20px; height: 10px; flex-grow: 1; background: #abcdef; }
+                #g2 { width: 20px; height: 10px; flex-grow: 2; background: #fedcba; }
+             </style>
+             <div id=\"host\"><div id=\"pct\"></div><div id=\"em\"></div></div>
+             <div id=\"row\"><div id=\"a\"></div><div id=\"b\"></div><div id=\"c\"></div></div>
+             <div id=\"grow\"><div id=\"g1\"></div><div id=\"g2\"></div></div>";
+        let doc = parse_html(html);
+        let styles = compute_styles(&doc, &parse_css(&doc.embedded_css()));
+        let tree = layout_document(&doc, &styles, 200.0);
+        let list = paint(&tree);
+        let painted = rasterize(&list, 200, 160, 0.0);
+        let mut cpu = Framebuffer::new(200, 160, PAPER);
+        for item in &list.items {
+            if let DisplayItem::Rect {
+                x,
+                y,
+                width,
+                height,
+                color,
+            } = item
+            {
+                cpu.fill_rect_cpu(*x, *y, *width, *height, *color);
+            }
+        }
+
+        fn find<'a>(
+            doc: &flux_dom::Document,
+            tree: &'a flux_layout::LayoutBox,
+            id: &str,
+        ) -> &'a flux_layout::LayoutBox {
+            if doc.get(tree.node).data().attr("id") == Some(id) {
+                return tree;
+            }
+            for child in &tree.children {
+                if doc.get(child.node).data().attr("id") == Some(id) {
+                    return child;
+                }
+                let nested = find(doc, child, id);
+                if doc.get(nested.node).data().attr("id") == Some(id) {
+                    return nested;
+                }
+            }
+            tree
+        }
+
+        let expect = [
+            ("pct", Color::parse("#ff0000").unwrap()),
+            ("em", Color::parse("#00ff00").unwrap()),
+            ("a", Color::parse("#aa0000").unwrap()),
+            ("b", Color::parse("#00aa00").unwrap()),
+            ("c", Color::parse("#0000aa").unwrap()),
+            ("g1", Color::parse("#abcdef").unwrap()),
+            ("g2", Color::parse("#fedcba").unwrap()),
+        ];
+        for (id, color) in expect {
+            let rect = find(&doc, &tree, id).rect;
+            let x = (rect.x + rect.width * 0.5).floor() as u32;
+            let y = (rect.y + rect.height * 0.5).floor() as u32;
+            assert_eq!(painted.pixel(x, y), Some(color), "{id}");
+            assert_eq!(cpu.pixel(x, y), painted.pixel(x, y), "{id}");
+        }
     }
 }
